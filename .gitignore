@@ -20,3 +20,17 @@ AGENTS.md
 CLAUDE.md
 tools/
 .harness/VERSION
+
+# 安全基线：敏感信息与构建产物
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+credentials.*
+bin/
+dist/
+build/
+coverage/
+coverage.out
