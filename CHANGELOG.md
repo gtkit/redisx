@@ -15,6 +15,7 @@ redisx 首个正式版本，为 `github.com/gtkit/redis`（v1/v2）的后继包�
 - 完整连接池与超时配置（`WithPoolSize`、`WithMinIdleConns`、`WithDialTimeout`、`WithReadTimeout`、`WithWriteTimeout`、`WithIdleTimeout`、`WithMaxRetries`）
 - 新增 `WithTLSConfig`，支持 TLS 连接 Redis（gtkit/redis v1/v2 均不支持）
 - 新增 `WithAllowPartialInit`，可选降级初始化：失败 DB 缺席集合、错误聚合返回，对齐 gtkit/redis v1 的部分成功语义（DefaultDB 仍须成功）
+- 新增 `InitError` 结构化错误：降级初始化部分失败时经 `errors.As` 提取，按 DB 编号获取失败原因做编程决策
 - 新增 `Proxy.Keys`，Pipeline 场景批量拼接多个 key 的前缀
 - 新增 `Consume` 受管消费：订阅确认、连接关闭、ctx 取消退出、handler panic 恢复均由库内管理，封掉裸 PubSub 忘 Close 的连接泄漏点
 - 新增 `PSubscribe` 模式订阅，模式自动拼接前缀

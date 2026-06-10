@@ -31,8 +31,8 @@ type Client struct {
 //
 // 初始化时会对每个 DB 执行 Ping 检查连通性，任一失败则返回错误并清理所有已创建的连接。
 // 启用 [WithAllowPartialInit] 后改为降级语义：失败的 DB 缺席集合，错误以
-// [errors.Join] 聚合后与可用的 Client 一同返回（两者可同时非 nil），但
-// DefaultDB 仍必须初始化成功，否则整体失败返回 nil。
+// [*InitError] 返回（与可用的 Client 可同时非 nil，可经 errors.As 按 DB 提取失败原因），
+// 但 DefaultDB 仍必须初始化成功，否则整体失败返回 nil。
 // clients/proxies map 在构建完成后不再修改，后续并发读取无需加锁。
 //
 // 用法:
@@ -72,16 +72,45 @@ func NewClient(opts ...Option) (*Client, error) {
 		}
 	}
 
-	clients := make(map[int]*redis.Client, len(dbPrefixes))
+	clients, failed, err := dialAll(cfg, dbPrefixes)
+	if err != nil {
+		return nil, err
+	}
 
-	// 初始化失败时负责清理已成功创建的连接
+	// 构建 Proxy 缓存——初始化后只读
+	proxies := make(map[int]*Proxy, len(clients))
+	for db, rdb := range clients {
+		prefix := dbPrefixes[db]
+		if prefix == "" {
+			prefix = cfg.KeyPrefix // 使用全局前缀
+		}
+		proxies[db] = &Proxy{rdb: rdb, prefix: prefix}
+	}
+
+	c := &Client{
+		defaultDB: cfg.DefaultDB,
+		keyPrefix: cfg.KeyPrefix,
+		clients:   clients,
+		proxies:   proxies,
+		defProxy:  proxies[cfg.DefaultDB],
+	}
+	if len(failed) > 0 {
+		return c, &InitError{Failed: failed}
+	}
+	return c, nil
+}
+
+// dialAll 为每个 DB 建立连接并 Ping 验证。
+//
+// 返回成功的连接集合与降级模式下各 DB 的失败原因；
+// 非降级模式（或 DefaultDB）失败时关闭全部已建连接并返回 error。
+func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Client, failed map[int]error, err error) {
+	clients = make(map[int]*redis.Client, len(dbPrefixes))
 	cleanup := func() {
 		for _, rdb := range clients {
 			_ = rdb.Close()
 		}
 	}
-
-	var initErrs []error
 
 	for db := range dbPrefixes {
 		rdb := redis.NewClient(&redis.Options{
@@ -101,40 +130,30 @@ func NewClient(opts ...Option) (*Client, error) {
 
 		// 每个 DB 独立超时，避免多 DB 串行 Ping 共享一个总超时导致后续 DB 被误判
 		pingCtx, pingCancel := context.WithTimeout(context.Background(), cfg.DialTimeout+2*time.Second)
-		err := rdb.Ping(pingCtx).Err()
+		pingFail := rdb.Ping(pingCtx).Err()
 		pingCancel()
-		if err != nil {
+		if pingFail != nil {
 			_ = rdb.Close() // 关闭当前这个也要关
-			pingErr := fmt.Errorf("redis: ping db=%d addr=%s: %w", db, cfg.Addr, err)
+			pingErr := fmt.Errorf("redis: ping db=%d addr=%s: %w", db, cfg.Addr, pingFail)
 			// 降级模式下非默认 DB 失败只记录不中断；默认 DB 承载 Client 级快捷方法，必须成功
 			if cfg.AllowPartialInit && db != cfg.DefaultDB {
-				initErrs = append(initErrs, pingErr)
+				if failed == nil {
+					failed = make(map[int]error)
+				}
+				failed[db] = pingErr
 				continue
 			}
 			cleanup()
-			return nil, errors.Join(append(initErrs, pingErr)...)
+			if len(failed) > 0 {
+				return nil, nil, errors.Join(append((&InitError{Failed: failed}).Unwrap(), pingErr)...)
+			}
+			return nil, nil, pingErr
 		}
 
 		clients[db] = rdb
 	}
 
-	// 构建 Proxy 缓存——初始化后只读
-	proxies := make(map[int]*Proxy, len(clients))
-	for db, rdb := range clients {
-		prefix := dbPrefixes[db]
-		if prefix == "" {
-			prefix = cfg.KeyPrefix // 使用全局前缀
-		}
-		proxies[db] = &Proxy{rdb: rdb, prefix: prefix}
-	}
-
-	return &Client{
-		defaultDB: cfg.DefaultDB,
-		keyPrefix: cfg.KeyPrefix,
-		clients:   clients,
-		proxies:   proxies,
-		defProxy:  proxies[cfg.DefaultDB],
-	}, errors.Join(initErrs...)
+	return clients, failed, nil
 }
 
 // Close 优雅关闭所有 DB 客户端连接。

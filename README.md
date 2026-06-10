@@ -91,7 +91,7 @@ c, err := redisx.NewClient(
 ## 多 DB 与前缀语义
 
 - 初始化默认为**全有或全无**：任一 DB Ping 失败，整体返回错误并回收已建连接。
-- 启用 `WithAllowPartialInit()` 后改为**降级模式**：失败的 DB 缺席集合，错误经 `errors.Join` 聚合后与可用的 Client 一同返回（两者可同时非 nil）；但 `DefaultDB` 承载 Client 级快捷方法，仍必须成功，否则整体失败。
+- 启用 `WithAllowPartialInit()` 后改为**降级模式**：失败的 DB 缺席集合，错误以 `*InitError` 与可用的 Client 一同返回（两者可同时非 nil），`errors.As` 提取后可按 DB 编号编程决策（`ie.Failed[db]`）；但 `DefaultDB` 承载 Client 级快捷方法，仍必须成功，否则整体失败。
 - `SelectDB(db)` 返回错误版代理；`MustSelectDB(db)` 未初始化时 panic，仅用于启动阶段。
 - 前缀优先级：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
 - `GetClient(db)` / `DefaultClient()` / `Proxy.RawClient()` 返回原生 `*redis.Client`，**不带前缀拼接**。
