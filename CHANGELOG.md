@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-10
+
 ### Added
 
 - 新增 `Client.AddHook`：将 go-redis Hook 一次性安装到所有已初始化 DB，用于外接熔断 / 限流 / metrics / tracing（库内不内置策略）
