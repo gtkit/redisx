@@ -138,6 +138,27 @@ if err := lock.Refresh(ctx, 30*time.Second); errors.Is(err, redisx.ErrLockLost) 
 
 语义边界：非 RedLock，主从故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底；不提供 watchdog 自动续期（生命周期由业务显式管理）。
 
+## Stream 消费组（可靠消息）
+
+Pub/Sub 是 at-most-once；需要可靠投递时使用 Stream 消费组（at-least-once）：
+
+```go
+// 生产
+c.XAdd(ctx, &redis.XAddArgs{Stream: "orders", Values: map[string]any{"id": 1001}})
+
+// 受管消费：自动建组（MKSTREAM）、崩溃重启续传 pending、handler 返回 nil 即 XACK
+err := c.ConsumeStream(ctx, redisx.StreamConfig{
+    Stream:   "orders",
+    Group:    "billing",
+    Consumer: "worker-1",                  // 组内唯一（如实例 ID）
+    AutoClaimMinIdle: 30 * time.Second,    // 可选：接管死消费者闲置超时的消息
+}, func(m redis.XMessage) error {
+    return process(m.Values) // 返回 error 则不确认，留在 pending 等待重投
+})
+```
+
+语义要点：handler 返回 error 的消息留在 pending（重启续传或被 AutoClaim 接管时重投），持续失败的消息请用 `XPENDING` 监控；handler 串行执行保证顺序；panic 恢复后终止消费并以 error 返回；ctx 取消优雅退出。
+
 ## 从 gtkit/redis 迁移
 
 ### 从 v2（`github.com/gtkit/redis/v2`）迁移

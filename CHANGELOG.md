@@ -20,6 +20,7 @@ redisx 首个正式版本，为 `github.com/gtkit/redis`（v1/v2）的后继包�
 - 新增 `Consume` 受管消费：订阅确认、连接关闭、ctx 取消退出、handler panic 恢复均由库内管理，封掉裸 PubSub 忘 Close 的连接泄漏点
 - 新增 `PSubscribe` 模式订阅，模式自动拼接前缀
 - 新增分布式锁：`TryLock` 获取（SET NX + 随机 token），`Lock.Release`/`Lock.Refresh` 经 Lua 校验 token 原子执行，杜绝误删他人锁；哨兵错误 `ErrLockNotObtained`/`ErrLockLost` 可 `errors.Is` 判断
+- 新增 Stream 消费组受管消费（at-least-once）：`ConsumeStream` 自动建组、崩溃重启续传 pending、handler 成功即 XACK、可选 `AutoClaimMinIdle` 接管死消费者消息；配套 `XAdd`/`XAck` 前缀透明透传
 - `Proxy` 命令代理：String / Hash / List / Set / ZSet / Pub-Sub / Lua / Pipeline，key 自动加前缀
 - `DelByPattern`：SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
 - `HealthCheck` 健康检查，聚合返回所有 DB 的失败信息

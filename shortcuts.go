@@ -262,6 +262,21 @@ func (c *Client) TryLock(ctx context.Context, key string, ttl time.Duration) (*L
 	return c.defProxy.TryLock(ctx, key, ttl)
 }
 
+// XAdd 在默认 DB 上追加消息到流。args.Stream 自动拼接前缀。
+func (c *Client) XAdd(ctx context.Context, args *goredis.XAddArgs) *goredis.StringCmd {
+	return c.defProxy.XAdd(ctx, args)
+}
+
+// XAck 在默认 DB 上确认消费组内消息。stream 自动拼接前缀。
+func (c *Client) XAck(ctx context.Context, stream, group string, ids ...string) *goredis.IntCmd {
+	return c.defProxy.XAck(ctx, stream, group, ids...)
+}
+
+// ConsumeStream 在默认 DB 上以消费组方式受管消费流消息。语义见 [Proxy.ConsumeStream]。
+func (c *Client) ConsumeStream(ctx context.Context, cfg StreamConfig, handler func(goredis.XMessage) error) error {
+	return c.defProxy.ConsumeStream(ctx, cfg, handler)
+}
+
 // DelByPattern 在默认 DB 上安全批量删除匹配 pattern 的 key。
 //
 // 使用 SCAN + UNLINK（需要 Redis >= 4.0），pattern 自动拼接前缀。返回成功删除的 key 总数。
