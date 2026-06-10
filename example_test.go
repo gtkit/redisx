@@ -119,6 +119,7 @@ func Example() {
 	pipe.Set(ctx, proxy.Key("batch:1"), "v1", time.Hour)
 	pipe.Set(ctx, proxy.Key("batch:2"), "v2", time.Hour)
 	pipe.Get(ctx, proxy.Key("batch:1"))
+	pipe.Del(ctx, proxy.Keys("batch:1", "batch:2")...) // 多 key 批量拼前缀
 	_, _ = pipe.Exec(ctx)
 
 	// ─── 13. Pub/Sub ───

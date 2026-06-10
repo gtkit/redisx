@@ -14,6 +14,8 @@ redisx 首个正式版本，为 `github.com/gtkit/redis`（v1/v2）的后继包�
 - 全局 key 前缀透明拼接，支持 per-DB 独立前缀（`WithKeyPrefix` / `WithDBConfig`）
 - 完整连接池与超时配置（`WithPoolSize`、`WithMinIdleConns`、`WithDialTimeout`、`WithReadTimeout`、`WithWriteTimeout`、`WithIdleTimeout`、`WithMaxRetries`）
 - 新增 `WithTLSConfig`，支持 TLS 连接 Redis（gtkit/redis v1/v2 均不支持）
+- 新增 `WithAllowPartialInit`，可选降级初始化：失败 DB 缺席集合、错误聚合返回，对齐 gtkit/redis v1 的部分成功语义（DefaultDB 仍须成功）
+- 新增 `Proxy.Keys`，Pipeline 场景批量拼接多个 key 的前缀
 - `Proxy` 命令代理：String / Hash / List / Set / ZSet / Pub-Sub / Lua / Pipeline，key 自动加前缀
 - `DelByPattern`：SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
 - `HealthCheck` 健康检查，聚合返回所有 DB 的失败信息

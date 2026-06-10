@@ -87,14 +87,16 @@ c, err := redisx.NewClient(
 | `WithWriteTimeout(d)` | 写超时 | 3s |
 | `WithIdleTimeout(d)` | 空闲连接回收时间 | 5m |
 | `WithTLSConfig(cfg)` | TLS 配置 | nil（不启用） |
+| `WithAllowPartialInit()` | 降级模式：失败 DB 缺席集合，错误聚合返回（DefaultDB 仍须成功） | 关闭（全有或全无） |
 
 ## 多 DB 与前缀语义
 
-- 初始化为**全有或全无**：任一 DB Ping 失败，整体返回错误并回收已建连接。
+- 初始化默认为**全有或全无**：任一 DB Ping 失败，整体返回错误并回收已建连接。
+- 启用 `WithAllowPartialInit()` 后改为**降级模式**：失败的 DB 缺席集合，错误经 `errors.Join` 聚合后与可用的 Client 一同返回（两者可同时非 nil）；但 `DefaultDB` 承载 Client 级快捷方法，仍必须成功，否则整体失败。
 - `SelectDB(db)` 返回错误版代理；`MustSelectDB(db)` 未初始化时 panic，仅用于启动阶段。
 - 前缀优先级：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
 - `GetClient(db)` / `DefaultClient()` / `Proxy.RawClient()` 返回原生 `*redis.Client`，**不带前缀拼接**。
-- Pipeline 内命令需手动用 `Proxy.Key(k)` 拼前缀（见 GoDoc Example）。
+- Pipeline 内命令需手动拼前缀：单 key 用 `Proxy.Key(k)`，多 key 用 `Proxy.Keys(k1, k2, ...)`（见 GoDoc Example）。
 
 ## 从 gtkit/redis 迁移
 
@@ -144,7 +146,7 @@ c.MustSelectDB(2).Set(ctx, "key:2", "v", 0) // 实际 key: "prefix:test2:key:2"
 
 注意两处行为差异：
 
-- v1 多库初始化是**部分成功**语义（失败的库缺席集合）；redisx 是**全有或全无**。
+- v1 多库初始化是**部分成功**语义（失败的库缺席集合）；redisx 默认**全有或全无**，需要 v1 语义时启用 `WithAllowPartialInit()`。
 - v1 `BatchDel` 用逐 key DEL；redisx `DelByPattern` 用批量 UNLINK，返回值多了删除计数。
 
 ## 并发安全

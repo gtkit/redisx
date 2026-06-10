@@ -61,6 +61,10 @@ type Config struct {
 
 	// TLSConfig 是连接 Redis 的 TLS 配置。nil 表示不启用 TLS。
 	TLSConfig *tls.Config
+
+	// AllowPartialInit 允许部分 DB 初始化失败（降级模式）。
+	// 默认 false：任一 DB 失败则整体失败（全有或全无）。
+	AllowPartialInit bool
 }
 
 // defaultConfig 返回包含生产合理默认值的 Config。
@@ -181,4 +185,14 @@ func WithKeyPrefix(prefix string) Option {
 // 适用于云厂商强制加密的 Redis 实例。nil 表示不启用 TLS。
 func WithTLSConfig(tlsConfig *tls.Config) Option {
 	return func(c *Config) { c.TLSConfig = tlsConfig }
+}
+
+// WithAllowPartialInit 允许部分 DB 初始化失败（降级模式）。
+//
+// 启用后，初始化失败的 DB 不进入集合，所有失败聚合后与可用的 Client
+// 一同返回（两者可同时非 nil），对缺席 DB 调用 [Client.SelectDB] 返回错误；
+// DefaultDB 承载 Client 级快捷方法，仍必须初始化成功，否则整体失败。
+// 默认关闭，即任一 DB 失败则整体失败（全有或全无）。
+func WithAllowPartialInit() Option {
+	return func(c *Config) { c.AllowPartialInit = true }
 }

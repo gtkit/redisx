@@ -34,6 +34,15 @@ func TestProxyKeys(t *testing.T) {
 	if got := p.keys(nil); len(got) != 0 {
 		t.Errorf("keys(nil) = %v, want 空", got)
 	}
+
+	exported := p.Keys("a", "b")
+	if !slices.Equal(exported, want) {
+		t.Errorf("Keys() = %v, want %v", exported, want)
+	}
+
+	if got := p.Keys(); len(got) != 0 {
+		t.Errorf("Keys() 无参 = %v, want 空", got)
+	}
 }
 
 func TestMSetOddArguments(t *testing.T) {

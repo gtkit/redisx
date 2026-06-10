@@ -34,6 +34,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.IdleTimeout != 5*time.Minute {
 		t.Errorf("IdleTimeout = %v, want 5m", cfg.IdleTimeout)
 	}
+	if cfg.AllowPartialInit {
+		t.Error("AllowPartialInit 默认应为 false（全有或全无）")
+	}
 }
 
 func TestOptionsApply(t *testing.T) {
@@ -57,6 +60,7 @@ func TestOptionsApply(t *testing.T) {
 		WithIdleTimeout(time.Minute),
 		WithKeyPrefix("app"),
 		WithTLSConfig(tlsCfg),
+		WithAllowPartialInit(),
 	}
 	for _, o := range opts {
 		o(cfg)
@@ -109,5 +113,8 @@ func TestOptionsApply(t *testing.T) {
 	}
 	if cfg.TLSConfig != tlsCfg {
 		t.Errorf("TLSConfig = %v, want %v", cfg.TLSConfig, tlsCfg)
+	}
+	if !cfg.AllowPartialInit {
+		t.Error("AllowPartialInit = false, want true")
 	}
 }

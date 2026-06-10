@@ -30,6 +30,9 @@ type Client struct {
 // NewClient 使用 Functional Options 创建 Redis 客户端。
 //
 // 初始化时会对每个 DB 执行 Ping 检查连通性，任一失败则返回错误并清理所有已创建的连接。
+// 启用 [WithAllowPartialInit] 后改为降级语义：失败的 DB 缺席集合，错误以
+// [errors.Join] 聚合后与可用的 Client 一同返回（两者可同时非 nil），但
+// DefaultDB 仍必须初始化成功，否则整体失败返回 nil。
 // clients/proxies map 在构建完成后不再修改，后续并发读取无需加锁。
 //
 // 用法:
@@ -78,6 +81,8 @@ func NewClient(opts ...Option) (*Client, error) {
 		}
 	}
 
+	var initErrs []error
+
 	for db := range dbPrefixes {
 		rdb := redis.NewClient(&redis.Options{
 			Addr:            cfg.Addr,
@@ -100,8 +105,14 @@ func NewClient(opts ...Option) (*Client, error) {
 		pingCancel()
 		if err != nil {
 			_ = rdb.Close() // 关闭当前这个也要关
+			pingErr := fmt.Errorf("redis: ping db=%d addr=%s: %w", db, cfg.Addr, err)
+			// 降级模式下非默认 DB 失败只记录不中断；默认 DB 承载 Client 级快捷方法，必须成功
+			if cfg.AllowPartialInit && db != cfg.DefaultDB {
+				initErrs = append(initErrs, pingErr)
+				continue
+			}
 			cleanup()
-			return nil, fmt.Errorf("redis: ping db=%d addr=%s: %w", db, cfg.Addr, err)
+			return nil, errors.Join(append(initErrs, pingErr)...)
 		}
 
 		clients[db] = rdb
@@ -123,7 +134,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		clients:   clients,
 		proxies:   proxies,
 		defProxy:  proxies[cfg.DefaultDB],
-	}, nil
+	}, errors.Join(initErrs...)
 }
 
 // Close 优雅关闭所有 DB 客户端连接。

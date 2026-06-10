@@ -7,6 +7,7 @@
 //   - 支持 per-DB 独立前缀
 //   - 完整连接池/超时配置（PoolSize、DialTimeout、ReadTimeout 等）
 //   - 支持 TLS 连接（WithTLSConfig）
+//   - 可选降级初始化（WithAllowPartialInit，失败 DB 缺席集合、错误聚合返回）
 //   - SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
 //   - 无内部日志：所有失败经返回值传递，由调用方决定日志策略；零日志框架依赖
 //   - HealthCheck 健康检查 API

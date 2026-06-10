@@ -50,6 +50,14 @@ func (p *Proxy) Key(k string) string {
 	return p.key(k)
 }
 
+// Keys 返回逐个拼接了前缀的完整 key 列表。
+//
+// 用于在 Pipeline 等需要手动拼接前缀的场景批量处理多个 key，
+// 例如 pipe.Del(ctx, proxy.Keys("k1", "k2")...)。
+func (p *Proxy) Keys(ks ...string) []string {
+	return p.keys(ks)
+}
+
 // ──────────────────────────────────────────
 //  String commands
 // ──────────────────────────────────────────

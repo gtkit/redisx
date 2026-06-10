@@ -3,6 +3,7 @@ package redisx
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPrefixKey(t *testing.T) {
@@ -67,5 +68,29 @@ func TestNewClientValidation(t *testing.T) {
 				t.Errorf("NewClient() 错误 = %q, 期望包含 %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestNewClientPartialInitDefaultDBMustSucceed 验证降级模式下 DefaultDB
+// 失败仍整体失败：Client 级快捷方法绑定默认 DB，缺它即不可用。
+func TestNewClientPartialInitDefaultDBMustSucceed(t *testing.T) {
+	t.Parallel()
+
+	// 127.0.0.1:1 无监听服务，连接立即被拒绝
+	c, err := NewClient(
+		WithAddr("127.0.0.1:1"),
+		WithAllowPartialInit(),
+		WithInitDBs(1),
+		WithDialTimeout(500*time.Millisecond),
+	)
+	if err == nil {
+		_ = c.Close()
+		t.Fatal("NewClient() 期望返回错误，实际为 nil")
+	}
+	if c != nil {
+		t.Errorf("DefaultDB 失败时 Client 应为 nil，实际 = %v", c)
+	}
+	if !strings.Contains(err.Error(), "ping db=0") {
+		t.Errorf("NewClient() 错误 = %q, 期望包含默认 DB 的 ping 失败", err.Error())
 	}
 }
