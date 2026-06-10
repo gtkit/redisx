@@ -16,15 +16,20 @@ const scanBatchSize int64 = 200
 
 // Client 是 Redis 多 DB 客户端封装。
 //
+// 嵌入的 [*Proxy] 是默认 DB 的命令代理，其全部命令方法（Get/Set/HSet/
+// ConsumeStream/TryLock 等）经方法提升直接在 Client 上可用，等价于
+// MustSelectDB(defaultDB) 上的同名调用，key 自动拼接前缀。
+//
 // 并发安全：内部 clients / proxies map 在 [NewClient] 中一次性构建完成后即为只读，
 // 不再修改，因此并发读取无需加锁——这是比 sync.RWMutex 更轻量的方案。
 // 底层每个 *redis.Client 本身也是并发安全的（go-redis 原生连接池）。
 type Client struct {
+	*Proxy // 默认 DB 的命令代理，方法提升为 Client 级快捷方式
+
 	defaultDB int                   // 默认 DB 编号
 	keyPrefix string                // 全局 key 前缀
 	clients   map[int]*redis.Client // 初始化后只读，无需锁保护
 	proxies   map[int]*Proxy        // 初始化后只读，每个 DB 对应一个缓存的 Proxy
-	defProxy  *Proxy                // 默认 DB 的 Proxy 缓存，避免热路径重复分配
 }
 
 // NewClient 使用 Functional Options 创建 Redis 客户端。
@@ -88,11 +93,11 @@ func NewClient(opts ...Option) (*Client, error) {
 	}
 
 	c := &Client{
+		Proxy:     proxies[cfg.DefaultDB],
 		defaultDB: cfg.DefaultDB,
 		keyPrefix: cfg.KeyPrefix,
 		clients:   clients,
 		proxies:   proxies,
-		defProxy:  proxies[cfg.DefaultDB],
 	}
 	if len(failed) > 0 {
 		return c, &InitError{Failed: failed}
@@ -102,6 +107,8 @@ func NewClient(opts ...Option) (*Client, error) {
 
 // dialAll 为每个 DB 建立连接并 Ping 验证。
 //
+// DefaultDB 优先拨号：它承载 Client 级快捷方法必须成功，失败时立即
+// fail-fast，其余 DB 无需再拨号；其余 DB 按编号升序，错误信息确定有序。
 // 返回成功的连接集合与降级模式下各 DB 的失败原因；
 // 非降级模式（或 DefaultDB）失败时关闭全部已建连接并返回 error。
 func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Client, failed map[int]error, err error) {
@@ -112,7 +119,15 @@ func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Cli
 		}
 	}
 
-	for db := range dbPrefixes {
+	order := make([]int, 0, len(dbPrefixes))
+	order = append(order, cfg.DefaultDB)
+	for _, db := range slices.Sorted(maps.Keys(dbPrefixes)) {
+		if db != cfg.DefaultDB {
+			order = append(order, db)
+		}
+	}
+
+	for _, db := range order {
 		rdb := redis.NewClient(&redis.Options{
 			Addr:            cfg.Addr,
 			Username:        cfg.Username,
@@ -143,10 +158,9 @@ func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Cli
 				failed[db] = pingErr
 				continue
 			}
+			// DefaultDB 优先拨号保证走到这里时 failed 必为空：
+			// 要么是 DefaultDB 自身失败（首个拨号），要么是非降级模式（不积累 failed）
 			cleanup()
-			if len(failed) > 0 {
-				return nil, nil, errors.Join(append((&InitError{Failed: failed}).Unwrap(), pingErr)...)
-			}
 			return nil, nil, pingErr
 		}
 
@@ -221,9 +235,39 @@ func (c *Client) DefaultClient() *redis.Client {
 	return c.clients[c.defaultDB]
 }
 
+// AddHook 将 hook 安装到所有已初始化 DB 的底层 [*redis.Client] 上。
+//
+// 用于一次性挂接熔断、限流、metrics、tracing 等中间件，库本身不内置任何策略。
+// hook 为 nil 时静默忽略。部分初始化（[WithAllowPartialInit]）模式下，
+// 初始化失败而缺席的 DB 自然跳过。
+//
+// 调用时机：与 go-redis 原生 AddHook 的约束一致，必须在 [NewClient] 之后、
+// 开始并发执行命令之前完成安装，运行中途添加不保证并发安全。
+// 如需只对个别 DB 安装，请改用 [Client.GetClient] 自行处理。
+func (c *Client) AddHook(hook redis.Hook) {
+	if hook == nil {
+		return
+	}
+	for _, rdb := range c.clients {
+		rdb.AddHook(hook)
+	}
+}
+
 // Prefix 返回当前配置的全局 key 前缀。
 func (c *Client) Prefix() string {
 	return c.keyPrefix
+}
+
+// PoolStats 返回每个已初始化 DB 的连接池统计，key 为 DB 编号。
+//
+// 透传 go-redis 的连接池统计（命中/未命中/超时/连接数等），供业务接入
+// 监控拉取；库本身不做任何聚合、阈值或告警判断。
+func (c *Client) PoolStats() map[int]*redis.PoolStats {
+	stats := make(map[int]*redis.PoolStats, len(c.clients))
+	for db, rdb := range c.clients {
+		stats[db] = rdb.PoolStats()
+	}
+	return stats
 }
 
 // prefixKey 为 key 拼接前缀。prefix 为空时直接返回原始 key。

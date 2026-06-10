@@ -472,13 +472,30 @@ func (p *Proxy) Consume(ctx context.Context, handler func(*redis.Message), chann
 	if len(channels) == 0 {
 		return errors.New("redisx: consume requires at least one channel")
 	}
+	return consumeSub(ctx, p.rdb.Subscribe(ctx, p.keys(channels)...), handler, channels)
+}
 
-	sub := p.rdb.Subscribe(ctx, p.keys(channels)...)
+// ConsumePattern 以受管方式按模式订阅（PSUBSCRIBE）并串行消费消息，
+// 生命周期语义与 [Proxy.Consume] 完全一致。所有模式自动拼接前缀
+// （如 "events:*" 实际订阅 "{prefix}:events:*"）。
+func (p *Proxy) ConsumePattern(ctx context.Context, handler func(*redis.Message), patterns ...string) error {
+	if handler == nil {
+		return errors.New("redisx: consume handler is nil")
+	}
+	if len(patterns) == 0 {
+		return errors.New("redisx: consume requires at least one pattern")
+	}
+	return consumeSub(ctx, p.rdb.PSubscribe(ctx, p.keys(patterns)...), handler, patterns)
+}
+
+// consumeSub 是 Consume / ConsumePattern 共用的受管消费循环：
+// 同步确认订阅、退出关闭订阅、ctx 取消返回其错误、handler panic 转为 error。
+func consumeSub(ctx context.Context, sub *redis.PubSub, handler func(*redis.Message), names []string) error {
 	defer sub.Close()
 
 	// 同步确认订阅成功，连接不可用时立即返回而非静默空转
 	if _, err := sub.Receive(ctx); err != nil {
-		return fmt.Errorf("redisx: subscribe %v: %w", channels, err)
+		return fmt.Errorf("redisx: subscribe %v: %w", names, err)
 	}
 
 	ch := sub.Channel()
@@ -550,6 +567,11 @@ func (p *Proxy) DelByPattern(ctx context.Context, pattern string) (int64, error)
 }
 
 // Scan 包装 SCAN 命令，match pattern 自动拼接前缀。
+//
+// 注意：返回的 key 是已含前缀的完整 key，直接回传给本库其他带前缀方法
+// （如 [Proxy.Del]）会造成二次拼接。如需对结果继续操作，请改用
+// [Proxy.RawClient] 执行，或自行剥离前缀；批量删除场景请直接使用
+// [Proxy.DelByPattern]。
 func (p *Proxy) Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd {
 	return p.rdb.Scan(ctx, cursor, p.key(match), count)
 }

@@ -10,7 +10,9 @@
 //   - 可选降级初始化（WithAllowPartialInit，失败 DB 缺席集合、错误聚合返回）
 //   - SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
 //   - 无内部日志：所有失败经返回值传递，由调用方决定日志策略；零日志框架依赖
-//   - HealthCheck 健康检查 API
+//   - HealthCheck 健康检查、PoolStats 连接池统计透传
+//   - AddHook 一次调用为所有 DB 挂接 go-redis Hook（外接熔断/限流/观测）
+//   - Client 内嵌默认 DB 的 Proxy，全部命令方法直接可用
 //   - 包名 redisx 与 go-redis 的 redis 包不冲突，业务层无需 import 别名
 //
 // 快速使用:

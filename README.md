@@ -9,8 +9,9 @@
 - 完整连接池 / 超时配置（PoolSize、MinIdleConns、DialTimeout、ReadTimeout 等）
 - 支持 TLS 连接（`WithTLSConfig`，适配云厂商强制加密实例）
 - `DelByPattern`：SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
-- `HealthCheck` 健康检查
-- `Proxy` 命令代理覆盖 String / Hash / List / Set / ZSet / Pub-Sub / Lua / Pipeline，key 自动加前缀
+- `HealthCheck` 健康检查、`PoolStats` 连接池统计透传，监控出口齐备
+- `Proxy` 命令代理覆盖 String / Hash / List / Set / ZSet / Pub-Sub / Stream / Lua / Pipeline，key 自动加前缀；`Client` 内嵌默认 DB 代理，全部命令直接可用
+- `AddHook` 一次调用为所有 DB 挂接 go-redis Hook，外接熔断 / 限流 / metrics / tracing
 - 包名 `redisx` 与 go-redis 的 `redis` 包不冲突，业务代码无需 import 别名
 
 ## 安装
@@ -54,6 +55,11 @@ deleted, err := c.DelByPattern(ctx, "user:*")
 if err := c.HealthCheck(ctx); err != nil {
     log.Printf("redis unhealthy: %v", err)
 }
+
+// 连接池统计（按 DB 编号透传 go-redis PoolStats），接入业务监控
+for db, s := range c.PoolStats() {
+    metrics.Report(db, s.Hits, s.Misses, s.Timeouts)
+}
 ```
 
 ### TLS 连接
@@ -94,7 +100,9 @@ c, err := redisx.NewClient(
 - 启用 `WithAllowPartialInit()` 后改为**降级模式**：失败的 DB 缺席集合，错误以 `*InitError` 与可用的 Client 一同返回（两者可同时非 nil），`errors.As` 提取后可按 DB 编号编程决策（`ie.Failed[db]`）；但 `DefaultDB` 承载 Client 级快捷方法，仍必须成功，否则整体失败。
 - `SelectDB(db)` 返回错误版代理；`MustSelectDB(db)` 未初始化时 panic，仅用于启动阶段。
 - 前缀优先级：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
+- `Client` 内嵌默认 DB 的 `Proxy`，其全部命令方法（含 `TryLock`、`ConsumeStream`、`XPending` 等）在 Client 上直接可用。
 - `GetClient(db)` / `DefaultClient()` / `Proxy.RawClient()` 返回原生 `*redis.Client`，**不带前缀拼接**。
+- `Scan` 返回的 key **已含前缀**，直接回传给本库带前缀方法会二次拼接；继续操作请走 `RawClient`，批量删除直接用 `DelByPattern`。
 - Pipeline 内命令需手动拼前缀：单 key 用 `Proxy.Key(k)`，多 key 用 `Proxy.Keys(k1, k2, ...)`（见 GoDoc Example）。
 
 ## Pub/Sub
@@ -108,6 +116,11 @@ err := c.Consume(ctx, func(m *redis.Message) {
     fmt.Println(m.Channel, m.Payload)
 }, "events:user")
 // ctx 取消时返回 context.Canceled，可据此判断优雅退出
+
+// 模式订阅的受管消费，生命周期语义与 Consume 一致
+err = c.ConsumePattern(ctx, func(m *redis.Message) {
+    fmt.Println(m.Pattern, m.Channel, m.Payload)
+}, "events:*")
 
 // 裸订阅 / 模式订阅：返回 *redis.PubSub，调用方负责 Close
 sub := c.PSubscribe(ctx, "events:*")
@@ -152,12 +165,62 @@ err := c.ConsumeStream(ctx, redisx.StreamConfig{
     Group:    "billing",
     Consumer: "worker-1",                  // 组内唯一（如实例 ID）
     AutoClaimMinIdle: 30 * time.Second,    // 可选：接管死消费者闲置超时的消息
+    OnError: func(m redis.XMessage, err error) {
+        log.Printf("msg %s failed: %v", m.ID, err) // 库内无日志，失败感知交给业务
+    },
 }, func(m redis.XMessage) error {
     return process(m.Values) // 返回 error 则不确认，留在 pending 等待重投
 })
+
+// 监控 pending 堆积（持续失败的消息会积压在这里）
+summary, err := c.XPending(ctx, "orders", "billing").Result()
 ```
 
-语义要点：handler 返回 error 的消息留在 pending（重启续传或被 AutoClaim 接管时重投），持续失败的消息请用 `XPENDING` 监控；handler 串行执行保证顺序；panic 恢复后终止消费并以 error 返回；ctx 取消优雅退出。
+语义要点：handler 返回 error 的消息留在 pending（重启续传或被 AutoClaim 接管时重投），失败明细经 `OnError` 回调感知，堆积用 `XPending` / `XPendingExt` 监控；handler 串行执行保证顺序；panic 恢复后终止消费并以 error 返回；ctx 取消优雅退出。另透传 `XLen` / `XRange` / `XDel` / `XTrimMaxLen` 便于流的日常管理。
+
+## 外接熔断器（Hook 扩展点）
+
+库本身不内置熔断 / 降级策略——这类决策属于业务层（回源数据库、返回兜底值还是直接报错，只有调用方知道）。库提供的是扩展点：`AddHook` 把任意 go-redis `redis.Hook` 一次性安装到**所有已初始化 DB** 的底层客户端上，可用于接入 gobreaker、sentinel-golang 等熔断库，或挂接限流、metrics、tracing 中间件。
+
+```go
+// breakerHook 用任意熔断器包装 Redis 命令执行链（以 gobreaker 风格为例）
+type breakerHook struct {
+    cb *gobreaker.CircuitBreaker // 业务自选的熔断器实现
+}
+
+func (h *breakerHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *breakerHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+    return func(ctx context.Context, cmd redis.Cmder) error {
+        _, err := h.cb.Execute(func() (any, error) {
+            return nil, next(ctx, cmd) // 熔断打开时直接快速失败，不再打到 Redis
+        })
+        return err
+    }
+}
+
+func (h *breakerHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+    return func(ctx context.Context, cmds []redis.Cmder) error {
+        _, err := h.cb.Execute(func() (any, error) {
+            return nil, next(ctx, cmds)
+        })
+        return err
+    }
+}
+
+// 初始化阶段安装，对所有 DB 生效
+c, err := redisx.NewClient(redisx.WithAddr("127.0.0.1:6379"), redisx.WithInitDBs(0, 1))
+if err != nil {
+    log.Fatal(err)
+}
+c.AddHook(&breakerHook{cb: newBreaker()})
+```
+
+注意事项：
+
+- **调用时机**：与 go-redis 原生 `AddHook` 约束一致，必须在 `NewClient` 之后、开始并发执行命令之前安装完成，运行中途添加不保证并发安全。
+- 只想对个别 DB 安装时，改用 `GetClient(db)` 拿到原生客户端后自行 `AddHook`。
+- 熔断快速失败时业务拿到的是熔断器返回的错误（如 gobreaker 的 `ErrOpenState`），可据此走降级分支（回源、兜底值等）。
 
 ## 从 gtkit/redis 迁移
 

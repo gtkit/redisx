@@ -70,4 +70,11 @@ func TestConsumeArgValidation(t *testing.T) {
 	if err := p.Consume(t.Context(), func(*redis.Message) {}); err == nil || !strings.Contains(err.Error(), "at least one channel") {
 		t.Errorf("空频道期望参数错误, 得到 %v", err)
 	}
+
+	if err := p.ConsumePattern(t.Context(), nil, "events:*"); err == nil || !strings.Contains(err.Error(), "handler is nil") {
+		t.Errorf("ConsumePattern nil handler 期望参数错误, 得到 %v", err)
+	}
+	if err := p.ConsumePattern(t.Context(), func(*redis.Message) {}); err == nil || !strings.Contains(err.Error(), "at least one pattern") {
+		t.Errorf("ConsumePattern 空模式期望参数错误, 得到 %v", err)
+	}
 }

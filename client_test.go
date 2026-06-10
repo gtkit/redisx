@@ -1,9 +1,13 @@
 package redisx
 
 import (
+	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func TestPrefixKey(t *testing.T) {
@@ -68,6 +72,86 @@ func TestNewClientValidation(t *testing.T) {
 				t.Errorf("NewClient() 错误 = %q, 期望包含 %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// recordHook 是只计数 ProcessHook 调用次数的测试 Hook。
+type recordHook struct {
+	processed atomic.Int32
+}
+
+func (h *recordHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *recordHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.processed.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (h *recordHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestAddHookInstallsOnAllClients 验证 AddHook 装到全部已初始化 DB：
+// 命令即使因连接失败而报错，ProcessHook 仍会被调用，可据此计数。
+func TestAddHookInstallsOnAllClients(t *testing.T) {
+	t.Parallel()
+
+	newDeadClient := func(db int) *redis.Client {
+		// 127.0.0.1:1 无监听服务，连接立即被拒绝
+		return redis.NewClient(&redis.Options{
+			Addr:        "127.0.0.1:1",
+			DB:          db,
+			DialTimeout: 500 * time.Millisecond,
+			MaxRetries:  -1, // 关闭重试，保证每条命令只触发一次 ProcessHook
+		})
+	}
+	c := &Client{clients: map[int]*redis.Client{0: newDeadClient(0), 1: newDeadClient(1)}}
+	t.Cleanup(func() { _ = c.Close() })
+
+	hook := &recordHook{}
+	c.AddHook(hook)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for db, rdb := range c.clients {
+		if err := rdb.Ping(ctx).Err(); err == nil {
+			t.Fatalf("db=%d 对无监听地址的 Ping 期望失败，实际成功", db)
+		}
+	}
+
+	if got := hook.processed.Load(); got != 2 {
+		t.Errorf("ProcessHook 调用次数 = %d, want 2", got)
+	}
+}
+
+// TestAddHookNil 验证 nil hook 被静默忽略，不 panic 也不影响命令执行链。
+func TestAddHookNil(t *testing.T) {
+	t.Parallel()
+
+	c := &Client{clients: map[int]*redis.Client{}}
+	c.AddHook(nil) // 不应 panic
+}
+
+// TestPoolStats 验证按 DB 编号返回每个已初始化客户端的池统计。
+func TestPoolStats(t *testing.T) {
+	t.Parallel()
+
+	c := &Client{clients: map[int]*redis.Client{
+		0: redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"}),
+		2: redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"}),
+	}}
+	t.Cleanup(func() { _ = c.Close() })
+
+	stats := c.PoolStats()
+	if len(stats) != 2 {
+		t.Fatalf("PoolStats 条目数 = %d, want 2", len(stats))
+	}
+	for _, db := range []int{0, 2} {
+		if stats[db] == nil {
+			t.Errorf("db=%d 的池统计为 nil", db)
+		}
 	}
 }
 

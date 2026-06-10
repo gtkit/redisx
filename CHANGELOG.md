@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 `Client.AddHook`：将 go-redis Hook 一次性安装到所有已初始化 DB，用于外接熔断 / 限流 / metrics / tracing（库内不内置策略）
+- 新增 `StreamConfig.OnError` 可选回调：Stream handler 业务失败时携带原始消息与错误同步通知业务侧（库内无日志设计下的失败感知口子）
+- 新增 Stream 监控与管理命令透传：`XPending` / `XPendingExt` / `XLen` / `XRange` / `XDel` / `XTrimMaxLen`，stream 自动拼前缀
+- 新增 `Client.PoolStats`：按 DB 编号透传 go-redis 连接池统计，供业务接入监控
+- 新增 `Proxy.ConsumePattern`：模式订阅（PSUBSCRIBE）的受管消费，生命周期语义与 `Consume` 一致
+
+### Changed
+
+- `Client` 内嵌默认 DB 的 `Proxy`，全部命令方法经提升直接可用：原快捷方法源码完全兼容，并自动补齐此前缺失的命令子集（`PTTL`、`LRem`、`SPop` 等）；删除约 300 行手抄委托样板
+- 初始化改为 DefaultDB 优先拨号：DefaultDB 失败立即整体失败且不再拨号其余 DB（fail-fast），其余 DB 按编号升序，错误信息确定有序
+- `Proxy.Scan` / `StreamConfig.Block` / `AutoClaimMinIdle` 文档补充使用陷阱说明（Scan 返回 key 已含前缀；Block 0 值取默认；AutoClaim 实际周期下限受 Block 钳制）
+
+### Fixed
+
+- 修复降级初始化（`WithAllowPartialInit`）下 DefaultDB 失败路径将 `*InitError` 摊平、导致 `errors.As` 无法提取的问题（DefaultDB 优先拨号后该路径不复存在）
+
 ## [1.0.0] - 2026-06-10
 
 redisx 首个正式版本，为 `github.com/gtkit/redis`（v1/v2）的后继包，能力完整覆盖两者；代码迁移自 `github.com/gtkit/redis/v2` 主干并改名为 `redisx`。
