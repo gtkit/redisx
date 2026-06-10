@@ -4,6 +4,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func TestProxyKey(t *testing.T) {
@@ -55,5 +57,17 @@ func TestMSetOddArguments(t *testing.T) {
 	}
 	if !strings.Contains(cmd.Err().Error(), "even number of arguments") {
 		t.Errorf("MSet 错误 = %q, 期望包含参数个数说明", cmd.Err().Error())
+	}
+}
+
+func TestConsumeArgValidation(t *testing.T) {
+	t.Parallel()
+
+	p := &Proxy{}
+	if err := p.Consume(t.Context(), nil, "ch"); err == nil || !strings.Contains(err.Error(), "handler is nil") {
+		t.Errorf("nil handler 期望参数错误, 得到 %v", err)
+	}
+	if err := p.Consume(t.Context(), func(*redis.Message) {}); err == nil || !strings.Contains(err.Error(), "at least one channel") {
+		t.Errorf("空频道期望参数错误, 得到 %v", err)
 	}
 }

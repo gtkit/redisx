@@ -2,8 +2,6 @@
 
 基于 [redis/go-redis v9](https://github.com/redis/go-redis) 的生产级 Redis 客户端封装。**错误全部通过返回值传递，库内不产生任何日志，外部直接依赖仅有 go-redis**。
 
-redisx 是 `github.com/gtkit/redis`（v1/v2）的后继包，能力完整覆盖两者，**新项目一律使用本包**；旧包进入维护模式，仅做缺陷修复。
-
 ## 特性
 
 - 无全局变量，多实例（多服务器/多套配置）共存
@@ -70,24 +68,25 @@ c, err := redisx.NewClient(
 
 ## 配置项（Functional Options）
 
-| Option | 说明 | 默认值 |
-|--------|------|--------|
-| `WithAddr(addr)` | 服务器地址 `host:port`（必填） | — |
-| `WithUsername(u)` | Redis 6+ ACL 用户名 | 空（不使用） |
-| `WithPassword(p)` | 认证密码 | 空（不认证） |
-| `WithDB(db)` | 默认 DB 编号 | 0 |
-| `WithInitDBs(dbs...)` | 初始化多个 DB（共享全局前缀） | 仅默认 DB |
-| `WithDBConfig(db, prefix)` | 初始化单个 DB 并指定独立前缀 | — |
-| `WithKeyPrefix(prefix)` | 全局 key 前缀 | 空（不加前缀） |
-| `WithPoolSize(n)` | 每个 DB 的最大连接数 | 10 |
-| `WithMinIdleConns(n)` | 最小空闲连接数 | 3 |
-| `WithMaxRetries(n)` | 命令失败重试次数（非幂等命令慎用，见 GoDoc） | 3 |
-| `WithDialTimeout(d)` | 建连超时 | 5s |
-| `WithReadTimeout(d)` | 读超时 | 3s |
-| `WithWriteTimeout(d)` | 写超时 | 3s |
-| `WithIdleTimeout(d)` | 空闲连接回收时间 | 5m |
-| `WithTLSConfig(cfg)` | TLS 配置 | nil（不启用） |
-| `WithAllowPartialInit()` | 降级模式：失败 DB 缺席集合，错误聚合返回（DefaultDB 仍须成功） | 关闭（全有或全无） |
+
+| Option                     | 说明                                                           | 默认值             |
+| -------------------------- | -------------------------------------------------------------- | ------------------ |
+| `WithAddr(addr)`           | 服务器地址`host:port`（必填）                                  | —                 |
+| `WithUsername(u)`          | Redis 6+ ACL 用户名                                            | 空（不使用）       |
+| `WithPassword(p)`          | 认证密码                                                       | 空（不认证）       |
+| `WithDB(db)`               | 默认 DB 编号                                                   | 0                  |
+| `WithInitDBs(dbs...)`      | 初始化多个 DB（共享全局前缀）                                  | 仅默认 DB          |
+| `WithDBConfig(db, prefix)` | 初始化单个 DB 并指定独立前缀                                   | —                 |
+| `WithKeyPrefix(prefix)`    | 全局 key 前缀                                                  | 空（不加前缀）     |
+| `WithPoolSize(n)`          | 每个 DB 的最大连接数                                           | 10                 |
+| `WithMinIdleConns(n)`      | 最小空闲连接数                                                 | 3                  |
+| `WithMaxRetries(n)`        | 命令失败重试次数（非幂等命令慎用，见 GoDoc）                   | 3                  |
+| `WithDialTimeout(d)`       | 建连超时                                                       | 5s                 |
+| `WithReadTimeout(d)`       | 读超时                                                         | 3s                 |
+| `WithWriteTimeout(d)`      | 写超时                                                         | 3s                 |
+| `WithIdleTimeout(d)`       | 空闲连接回收时间                                               | 5m                 |
+| `WithTLSConfig(cfg)`       | TLS 配置                                                       | nil（不启用）      |
+| `WithAllowPartialInit()`   | 降级模式：失败 DB 缺席集合，错误聚合返回（DefaultDB 仍须成功） | 关闭（全有或全无） |
 
 ## 多 DB 与前缀语义
 
@@ -97,6 +96,25 @@ c, err := redisx.NewClient(
 - 前缀优先级：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
 - `GetClient(db)` / `DefaultClient()` / `Proxy.RawClient()` 返回原生 `*redis.Client`，**不带前缀拼接**。
 - Pipeline 内命令需手动拼前缀：单 key 用 `Proxy.Key(k)`，多 key 用 `Proxy.Keys(k1, k2, ...)`（见 GoDoc Example）。
+
+## Pub/Sub
+
+```go
+// 发布（channel 自动拼前缀）
+c.Publish(ctx, "events:user", "user_created")
+
+// 受管消费（推荐）：订阅确认、连接关闭、ctx 退出、panic 恢复均由库内管理
+err := c.Consume(ctx, func(m *redis.Message) {
+    fmt.Println(m.Channel, m.Payload)
+}, "events:user")
+// ctx 取消时返回 context.Canceled，可据此判断优雅退出
+
+// 裸订阅 / 模式订阅：返回 *redis.PubSub，调用方负责 Close
+sub := c.PSubscribe(ctx, "events:*")
+defer sub.Close()
+```
+
+注意：Redis Pub/Sub 为 at-most-once，断线期间消息会丢失；`Consume` 的 handler 串行执行以保证单频道顺序，耗时处理请投递到业务自有 worker。
 
 ## 从 gtkit/redis 迁移
 
@@ -135,14 +153,15 @@ c, err := redisx.NewClient(
 c.MustSelectDB(2).Set(ctx, "key:2", "v", 0) // 实际 key: "prefix:test2:key:2"
 ```
 
-| v1 | redisx |
-|----|--------|
-| `NewCollection(opts...)` | `NewClient(opts...)` |
-| `WithDB(db, prefix)` | `WithDBConfig(db, prefix)` |
-| `Select(db)` | `SelectDB(db)` / `MustSelectDB(db)` |
-| `Client(db)` | `GetClient(db)` |
-| `rdb.Prefix() + key` 手动拼接 | 自动拼接 |
-| `BatchDel(ctx, pattern)` | `DelByPattern(ctx, pattern)` |
+
+| v1                            | redisx                              |
+| ----------------------------- | ----------------------------------- |
+| `NewCollection(opts...)`      | `NewClient(opts...)`                |
+| `WithDB(db, prefix)`          | `WithDBConfig(db, prefix)`          |
+| `Select(db)`                  | `SelectDB(db)` / `MustSelectDB(db)` |
+| `Client(db)`                  | `GetClient(db)`                     |
+| `rdb.Prefix() + key` 手动拼接 | 自动拼接                            |
+| `BatchDel(ctx, pattern)`      | `DelByPattern(ctx, pattern)`        |
 
 注意两处行为差异：
 

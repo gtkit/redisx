@@ -2,6 +2,7 @@ package redisx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -441,9 +442,70 @@ func (p *Proxy) Publish(ctx context.Context, channel string, message any) *redis
 
 // Subscribe 订阅一个或多个 channel。所有 channel 自动拼接前缀。
 //
-// 返回 [*redis.PubSub]，调用方负责关闭。
+// 返回 [*redis.PubSub]，调用方负责关闭；如需自动管理订阅生命周期，
+// 请使用 [Proxy.Consume]。
 func (p *Proxy) Subscribe(ctx context.Context, channels ...string) *redis.PubSub {
 	return p.rdb.Subscribe(ctx, p.keys(channels)...)
+}
+
+// PSubscribe 按模式订阅一个或多个 channel 模式（如 "events:*"）。
+// 所有模式自动拼接前缀。
+//
+// 返回 [*redis.PubSub]，调用方负责关闭。
+func (p *Proxy) PSubscribe(ctx context.Context, patterns ...string) *redis.PubSub {
+	return p.rdb.PSubscribe(ctx, p.keys(patterns)...)
+}
+
+// Consume 以受管方式订阅频道并串行消费消息，阻塞直到 ctx 取消或出错。
+//
+// 订阅生命周期由库内管理：订阅确认失败立即返回错误，退出时自动关闭订阅；
+// ctx 取消时返回 ctx 的错误（可用 errors.Is(err, context.Canceled) 判断优雅退出）；
+// handler panic 会被恢复，消费终止并以 error 返回。
+//
+// handler 串行执行以保证单频道消息顺序，耗时处理请在业务侧自行分发。
+// 注意 Redis Pub/Sub 为 at-most-once，断线期间的消息会丢失；
+// 需要可靠投递请使用 Stream。所有 channel 自动拼接前缀。
+func (p *Proxy) Consume(ctx context.Context, handler func(*redis.Message), channels ...string) error {
+	if handler == nil {
+		return errors.New("redisx: consume handler is nil")
+	}
+	if len(channels) == 0 {
+		return errors.New("redisx: consume requires at least one channel")
+	}
+
+	sub := p.rdb.Subscribe(ctx, p.keys(channels)...)
+	defer sub.Close()
+
+	// 同步确认订阅成功，连接不可用时立即返回而非静默空转
+	if _, err := sub.Receive(ctx); err != nil {
+		return fmt.Errorf("redisx: subscribe %v: %w", channels, err)
+	}
+
+	ch := sub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("redisx: consume: %w", ctx.Err())
+		case msg, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if err := safeHandle(handler, msg); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// safeHandle 执行 handler 并将 panic 转换为 error 返回。
+func safeHandle(handler func(*redis.Message), msg *redis.Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("redisx: consume handler panic: %v", r)
+		}
+	}()
+	handler(msg)
+	return nil
 }
 
 // ──────────────────────────────────────────

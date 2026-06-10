@@ -243,6 +243,16 @@ func (c *Client) Subscribe(ctx context.Context, channels ...string) *goredis.Pub
 	return c.defProxy.Subscribe(ctx, channels...)
 }
 
+// PSubscribe 在默认 DB 上按模式订阅。模式自动拼接前缀。
+func (c *Client) PSubscribe(ctx context.Context, patterns ...string) *goredis.PubSub {
+	return c.defProxy.PSubscribe(ctx, patterns...)
+}
+
+// Consume 在默认 DB 上以受管方式订阅并消费消息。语义见 [Proxy.Consume]。
+func (c *Client) Consume(ctx context.Context, handler func(*goredis.Message), channels ...string) error {
+	return c.defProxy.Consume(ctx, handler, channels...)
+}
+
 // ──────────────────────────────────────────
 //  Scan & batch deletion shortcuts
 // ──────────────────────────────────────────
