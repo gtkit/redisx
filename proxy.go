@@ -75,8 +75,11 @@ func (p *Proxy) Set(ctx context.Context, key string, value any, expiration time.
 }
 
 // SetEX 设置 key-value 并指定过期时间。key 自动拼接前缀。
+//
+// 内部使用 SET 带过期实现（SETEX 的现代等价形式）；
+// expiration 为 0 时等同于无过期时间的 SET。
 func (p *Proxy) SetEX(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd {
-	return p.rdb.SetEx(ctx, p.key(key), value, expiration) //nolint:staticcheck // 透传 go-redis 命令，保留完整命令集（go-redis 已标记弃用但仍可用）
+	return p.rdb.Set(ctx, p.key(key), value, expiration)
 }
 
 // SetNX 仅当 key 不存在时设置。key 自动拼接前缀。
@@ -87,8 +90,13 @@ func (p *Proxy) SetNX(ctx context.Context, key string, value any, expiration tim
 }
 
 // GetSet 设置新值并返回旧值。key 自动拼接前缀。
+//
+// 内部使用 SET ... GET 实现（GETSET 的现代等价形式，需要 Redis >= 6.2）；
+// 旧值不存在时返回 redis.Nil，新值仍会写入。
 func (p *Proxy) GetSet(ctx context.Context, key string, value any) *redis.StringCmd {
-	return p.rdb.GetSet(ctx, p.key(key), value) //nolint:staticcheck // 透传 go-redis 命令，保留完整命令集（go-redis 已标记弃用但仍可用）
+	cmd := redis.NewStringCmd(ctx, "set", p.key(key), value, "get")
+	_ = p.rdb.Process(ctx, cmd)
+	return cmd
 }
 
 // GetDel 获取 key 的值并删除该 key。key 自动拼接前缀。
@@ -372,13 +380,29 @@ func (p *Proxy) ZRange(ctx context.Context, key string, start, stop int64) *redi
 }
 
 // ZRevRange 按排名范围逆序返回有序集合成员。key 自动拼接前缀。
+//
+// 内部使用 ZRANGE ... REV 实现（ZREVRANGE 的现代等价形式，需要 Redis >= 6.2）。
 func (p *Proxy) ZRevRange(ctx context.Context, key string, start, stop int64) *redis.StringSliceCmd {
-	return p.rdb.ZRevRange(ctx, p.key(key), start, stop) //nolint:staticcheck // 透传 go-redis 命令，保留完整命令集（go-redis 已标记弃用但仍可用）
+	return p.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+		Key:   p.key(key),
+		Start: start,
+		Stop:  stop,
+		Rev:   true,
+	})
 }
 
 // ZRangeByScore 按分值范围返回有序集合成员。key 自动拼接前缀。
+//
+// 内部使用 ZRANGE ... BYSCORE 实现（ZRANGEBYSCORE 的现代等价形式，需要 Redis >= 6.2）。
 func (p *Proxy) ZRangeByScore(ctx context.Context, key string, opt *redis.ZRangeBy) *redis.StringSliceCmd {
-	return p.rdb.ZRangeByScore(ctx, p.key(key), opt) //nolint:staticcheck // 透传 go-redis 命令，保留完整命令集（go-redis 已标记弃用但仍可用）
+	return p.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+		Key:     p.key(key),
+		Start:   opt.Min,
+		Stop:    opt.Max,
+		ByScore: true,
+		Offset:  opt.Offset,
+		Count:   opt.Count,
+	})
 }
 
 // ZRem 移除有序集合中一个或多个成员。key 自动拼接前缀。

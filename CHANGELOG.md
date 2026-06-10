@@ -24,3 +24,4 @@ redisx 首个正式版本，为 `github.com/gtkit/redis`（v1/v2）的后继包�
 
 - 包名由 `redis` 改为 `redisx`，与 go-redis 的 `redis` 包不再冲突，业务代码无需 import 别名
 - 底层 go-redis 升级至 v9.20.0
+- 透传层不再调用 go-redis 已弃用方法：`SetEX`/`GetSet`/`ZRevRange`/`ZRangeByScore` 改用现代等价命令实现（SET 带过期、SET..GET、ZRANGE REV/BYSCORE），导出签名与语义不变；`GetSet`/`ZRevRange`/`ZRangeByScore` 需要 Redis >= 6.2
