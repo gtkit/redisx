@@ -116,6 +116,28 @@ defer sub.Close()
 
 注意：Redis Pub/Sub 为 at-most-once，断线期间消息会丢失；`Consume` 的 handler 串行执行以保证单频道顺序，耗时处理请投递到业务自有 worker。
 
+## 分布式锁
+
+单 Redis 实例锁：SET NX + 随机 token，Lua 校验 token 后原子释放/续期，杜绝误删他人锁。
+
+```go
+lock, err := c.TryLock(ctx, "job:daily-report", 30*time.Second)
+if errors.Is(err, redisx.ErrLockNotObtained) {
+    return // 他人持有，按业务节奏稍后重试
+}
+if err != nil {
+    return err
+}
+defer lock.Release(ctx)
+
+// 长任务期间显式续期；锁已失去返回 ErrLockLost
+if err := lock.Refresh(ctx, 30*time.Second); errors.Is(err, redisx.ErrLockLost) {
+    return // 锁已过期被他人接管，停止当前工作
+}
+```
+
+语义边界：非 RedLock，主从故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底；不提供 watchdog 自动续期（生命周期由业务显式管理）。
+
 ## 从 gtkit/redis 迁移
 
 ### 从 v2（`github.com/gtkit/redis/v2`）迁移

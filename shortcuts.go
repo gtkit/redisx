@@ -257,6 +257,11 @@ func (c *Client) Consume(ctx context.Context, handler func(*goredis.Message), ch
 //  Scan & batch deletion shortcuts
 // ──────────────────────────────────────────
 
+// TryLock 在默认 DB 上尝试获取分布式锁。语义见 [Proxy.TryLock]。
+func (c *Client) TryLock(ctx context.Context, key string, ttl time.Duration) (*Lock, error) {
+	return c.defProxy.TryLock(ctx, key, ttl)
+}
+
 // DelByPattern 在默认 DB 上安全批量删除匹配 pattern 的 key。
 //
 // 使用 SCAN + UNLINK（需要 Redis >= 4.0），pattern 自动拼接前缀。返回成功删除的 key 总数。
