@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-06-11
+
+### Changed
+
+- README 重写为全面使用文档：初始化与配置全表、Key 前缀机制、多 DB、各命令族示例、Pipeline / Lua、Pub/Sub、分布式锁、Stream 消费组、监控运维、Hook 扩展点、已知边界；移除 gtkit/redis 迁移章节（迁移说明保留在 1.0.0 版本记录中）
+
 ## [1.1.0] - 2026-06-10
 
 ### Added
