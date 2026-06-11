@@ -1,6 +1,8 @@
 # redisx
 
-基于 [redis/go-redis v9](https://github.com/redis/go-redis) 的生产级 Redis 客户端封装。**错误全部通过返回值传递，库内不产生任何日志，外部直接依赖仅有 go-redis**。
+基于 [redis/go-redis v9](https://github.com/redis/go-redis) 的生产级 Redis 客户端封装。
+
+**设计原则**：错误全部通过返回值传递，库内不产生任何日志；不内置熔断、降级、重试编排等策略，只提供扩展点；外部直接依赖仅有 go-redis。
 
 ## 特性
 
@@ -8,9 +10,12 @@
 - 全局 key 前缀透明拼接，业务层无感知；支持每库（per-DB）独立前缀
 - 完整连接池 / 超时配置（PoolSize、MinIdleConns、DialTimeout、ReadTimeout 等）
 - 支持 TLS 连接（`WithTLSConfig`，适配云厂商强制加密实例）
+- 可选降级初始化（`WithAllowPartialInit`），失败 DB 经 `InitError` 按编号提取
+- `Proxy` 命令代理覆盖 String / Hash / List / Set / ZSet / Pub-Sub / Stream / Lua / Pipeline，key 自动加前缀；`Client` 内嵌默认 DB 代理，全部命令直接可用
+- `Consume` / `ConsumePattern` 受管订阅消费，`ConsumeStream` 消费组可靠消费（at-least-once）
+- 单实例分布式锁：`TryLock` / `Release` / `Refresh`，Lua 校验 token 杜绝误删
 - `DelByPattern`：SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
 - `HealthCheck` 健康检查、`PoolStats` 连接池统计透传，监控出口齐备
-- `Proxy` 命令代理覆盖 String / Hash / List / Set / ZSet / Pub-Sub / Stream / Lua / Pipeline，key 自动加前缀；`Client` 内嵌默认 DB 代理，全部命令直接可用
 - `AddHook` 一次调用为所有 DB 挂接 go-redis Hook，外接熔断 / 限流 / metrics / tracing
 - 包名 `redisx` 与 go-redis 的 `redis` 包不冲突，业务代码无需 import 别名
 
@@ -20,7 +25,7 @@
 go get github.com/gtkit/redisx@latest
 ```
 
-要求 Go 1.26+；`DelByPattern` 依赖 UNLINK，要求 Redis >= 4.0。
+要求 Go 1.26+、Redis >= 4.0（`DelByPattern` 依赖 UNLINK）；`GetSet`、`ZRevRange`、`ZRangeByScore`、`XAUTOCLAIM` 等现代命令实现需要 Redis >= 6.2。
 
 ## 快速开始
 
@@ -47,33 +52,13 @@ val, err := c.Get(ctx, "user:1").Result()
 
 // 切换 DB 链式调用，DB2 的 key 前缀为 "session:"
 token, err := c.MustSelectDB(2).Get(ctx, "token:abc").Result()
-
-// SCAN + UNLINK 安全批量删除
-deleted, err := c.DelByPattern(ctx, "user:*")
-
-// 健康检查
-if err := c.HealthCheck(ctx); err != nil {
-    log.Printf("redis unhealthy: %v", err)
-}
-
-// 连接池统计（按 DB 编号透传 go-redis PoolStats），接入业务监控
-for db, s := range c.PoolStats() {
-    metrics.Report(db, s.Hits, s.Misses, s.Timeouts)
-}
 ```
 
-### TLS 连接
+---
 
-```go
-c, err := redisx.NewClient(
-    redisx.WithAddr("redis.example.com:6380"),
-    redisx.WithPassword(os.Getenv("REDIS_PASSWORD")),
-    redisx.WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12}),
-)
-```
+## 初始化与配置
 
-## 配置项（Functional Options）
-
+### 全部配置项（Functional Options）
 
 | Option                     | 说明                                                           | 默认值             |
 | -------------------------- | -------------------------------------------------------------- | ------------------ |
@@ -86,7 +71,7 @@ c, err := redisx.NewClient(
 | `WithKeyPrefix(prefix)`    | 全局 key 前缀                                                  | 空（不加前缀）     |
 | `WithPoolSize(n)`          | 每个 DB 的最大连接数                                           | 10                 |
 | `WithMinIdleConns(n)`      | 最小空闲连接数                                                 | 3                  |
-| `WithMaxRetries(n)`        | 命令失败重试次数（非幂等命令慎用，见 GoDoc）                   | 3                  |
+| `WithMaxRetries(n)`        | 命令失败重试次数（非幂等命令慎用，见下文）                     | 3                  |
 | `WithDialTimeout(d)`       | 建连超时                                                       | 5s                 |
 | `WithReadTimeout(d)`       | 读超时                                                         | 3s                 |
 | `WithWriteTimeout(d)`      | 写超时                                                         | 3s                 |
@@ -94,18 +79,256 @@ c, err := redisx.NewClient(
 | `WithTLSConfig(cfg)`       | TLS 配置                                                       | nil（不启用）      |
 | `WithAllowPartialInit()`   | 降级模式：失败 DB 缺席集合，错误聚合返回（DefaultDB 仍须成功） | 关闭（全有或全无） |
 
-## 多 DB 与前缀语义
+**关于 `WithMaxRetries`**：对非幂等命令（如 `INCR`、`LPUSH`），读超时后的自动重试可能导致命令被重复执行。对此敏感的场景请设置为 0 关闭重试，或在业务层用 Lua 脚本保证幂等。
 
-- 初始化默认为**全有或全无**：任一 DB Ping 失败，整体返回错误并回收已建连接。
-- 启用 `WithAllowPartialInit()` 后改为**降级模式**：失败的 DB 缺席集合，错误以 `*InitError` 与可用的 Client 一同返回（两者可同时非 nil），`errors.As` 提取后可按 DB 编号编程决策（`ie.Failed[db]`）；但 `DefaultDB` 承载 Client 级快捷方法，仍必须成功，否则整体失败。
-- `SelectDB(db)` 返回错误版代理；`MustSelectDB(db)` 未初始化时 panic，仅用于启动阶段。
-- 前缀优先级：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
-- `Client` 内嵌默认 DB 的 `Proxy`，其全部命令方法（含 `TryLock`、`ConsumeStream`、`XPending` 等）在 Client 上直接可用。
-- `GetClient(db)` / `DefaultClient()` / `Proxy.RawClient()` 返回原生 `*redis.Client`，**不带前缀拼接**。
-- `Scan` 返回的 key **已含前缀**，直接回传给本库带前缀方法会二次拼接；继续操作请走 `RawClient`，批量删除直接用 `DelByPattern`。
-- Pipeline 内命令需手动拼前缀：单 key 用 `Proxy.Key(k)`，多 key 用 `Proxy.Keys(k1, k2, ...)`（见 GoDoc Example）。
+### 初始化语义
+
+- `NewClient` 会对每个声明的 DB 建立独立连接池并执行 PING 验证，**DefaultDB 优先拨号**：它承载 Client 级快捷方法，失败时立即整体失败，其余 DB 不再拨号；其余 DB 按编号升序拨号，错误信息确定有序。
+- 默认**全有或全无**：任一 DB 验证失败，整体返回错误并回收已建连接。
+- `clients` / `proxies` 集合在构建完成后只读，后续并发使用无需加锁。
+
+### 降级初始化与 InitError
+
+启用 `WithAllowPartialInit()` 后，非默认 DB 初始化失败不再阻断整体：失败的 DB 缺席集合，错误以 `*InitError` 与**可用的** Client 一同返回（两者可同时非 nil）：
+
+```go
+c, err := redisx.NewClient(
+    redisx.WithAddr("127.0.0.1:6379"),
+    redisx.WithInitDBs(0, 1, 2),
+    redisx.WithAllowPartialInit(),
+)
+var ie *redisx.InitError
+if errors.As(err, &ie) {
+    for db, cause := range ie.Failed {
+        log.Printf("db=%d 初始化失败: %v", db, cause) // 按业务决定降级还是拒绝启动
+    }
+}
+if c == nil {
+    log.Fatal(err) // DefaultDB 失败时 Client 为 nil，整体不可用
+}
+```
+
+`InitError.Unwrap()` 返回各 DB 的底层错误，`errors.Is` 可穿透到网络层错误。对缺席 DB 调用 `SelectDB` 返回错误。
+
+### TLS 连接
+
+```go
+c, err := redisx.NewClient(
+    redisx.WithAddr("redis.example.com:6380"),
+    redisx.WithPassword(os.Getenv("REDIS_PASSWORD")),
+    redisx.WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12}),
+)
+```
+
+---
+
+## Key 前缀机制
+
+设置 `WithKeyPrefix("myapp")` 后，所有带 key 参数的命令自动拼接为 `myapp:{key}`，业务层无感知。
+
+**前缀优先级**：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
+
+**不拼前缀的出口**（需要自己负责完整 key）：
+
+- `GetClient(db)` / `DefaultClient()` / `Proxy.RawClient()` 返回原生 `*redis.Client`；
+- `Pipeline()` / `TxPipeline()` 内的命令（见 [Pipeline 与事务](#pipeline-与事务)）；
+- Lua 脚本体内自行构造的 key（`Eval` 系列只对 keys 参数列表拼前缀）。
+
+**陷阱**：`Scan` 返回的 key **已含前缀**，直接回传给本库其他带前缀方法（如 `Del`）会二次拼接。继续操作请走 `RawClient`，批量删除直接用 `DelByPattern`。
+
+手动拼接工具（Pipeline 等场景）：
+
+```go
+p := c.MustSelectDB(0)
+full := p.Key("user:1")           // "myapp:user:1"
+fulls := p.Keys("k1", "k2")       // ["myapp:k1", "myapp:k2"]
+prefix := c.Prefix()              // "myapp"
+```
+
+---
+
+## 多 DB 使用
+
+```go
+p, err := c.SelectDB(1)   // DB 未初始化时返回错误（错误信息列出可用 DB）
+p := c.MustSelectDB(1)    // 未初始化时 panic，仅用于启动阶段或确定存在的场景
+
+rdb, ok := c.GetClient(1) // 原生 *redis.Client，不拼前缀
+rdb := c.DefaultClient()  // 默认 DB 的原生客户端
+```
+
+`Client` 内嵌默认 DB 的 `Proxy`，**`Proxy` 的全部命令方法在 Client 上直接可用**，等价于 `c.MustSelectDB(defaultDB).Xxx(...)`。每个 DB 的 `Proxy` 在初始化时缓存，重复获取无额外分配。
+
+需要连接**多个 Redis 服务器**时，分别 `NewClient` 即可，实例间完全独立（无全局变量）。
+
+---
+
+## 常用命令
+
+所有命令返回 go-redis 原生的 `*redis.XxxCmd`，用 `.Result()` / `.Val()` / `.Err()` 取值；key 一律自动拼前缀。
+
+### 错误处理
+
+key 不存在时 `Get`、`HGet` 等返回 `redis.Nil`，这是"未命中"而非故障，务必区分：
+
+```go
+val, err := c.Get(ctx, "user:1").Result()
+switch {
+case errors.Is(err, redis.Nil):
+    // 缓存未命中，回源
+case err != nil:
+    // 真实错误（网络/超时），按业务决定降级或上报
+default:
+    // 命中
+}
+```
+
+库内不产生日志，所有失败都经返回值传出，日志策略完全由调用方决定。
+
+### String / 计数器
+
+```go
+c.Set(ctx, "k", "v", time.Hour)        // expiration 为 0 表示不过期
+c.SetEX(ctx, "k", "v", time.Hour)      // SET 带过期（SETEX 现代等价）
+ok, _ := c.SetNX(ctx, "k", "v", ttl).Result() // 不存在才写，true=写入成功
+old, _ := c.GetSet(ctx, "k", "new").Result()  // 写新值返回旧值（SET..GET，Redis>=6.2）
+v, _ := c.GetDel(ctx, "k").Result()    // 取值并删除
+
+c.Incr(ctx, "counter")                 // +1
+c.IncrBy(ctx, "counter", 10)
+c.IncrByFloat(ctx, "price", 0.5)
+c.Decr(ctx, "counter")
+c.DecrBy(ctx, "counter", 10)
+
+vals, _ := c.MGet(ctx, "k1", "k2").Result()       // 批量取，缺失项为 nil
+c.MSet(ctx, "k1", "v1", "k2", "v2")               // 交替 key-value，长度必须为偶数
+```
+
+### Key 管理
+
+```go
+c.Del(ctx, "k1", "k2")                  // 返回删除数量
+n, _ := c.Exists(ctx, "k1", "k2").Result() // 返回存在数量
+c.Expire(ctx, "k", time.Hour)
+c.ExpireAt(ctx, "k", deadline)
+c.Persist(ctx, "k")                     // 移除过期时间
+d, _ := c.TTL(ctx, "k").Result()        // -2=不存在 -1=无过期
+c.PTTL(ctx, "k")                        // 毫秒精度
+c.Type(ctx, "k")
+c.Rename(ctx, "old", "new")             // 两个 key 都拼前缀
+```
+
+### Hash
+
+```go
+c.HSet(ctx, "user:1", "name", "alice", "age", 18) // field-value 对
+v, _ := c.HGet(ctx, "user:1", "name").Result()
+all, _ := c.HGetAll(ctx, "user:1").Result()        // map[string]string
+vals, _ := c.HMGet(ctx, "user:1", "name", "age").Result()
+c.HDel(ctx, "user:1", "age")
+ok, _ := c.HExists(ctx, "user:1", "name").Result()
+n, _ := c.HLen(ctx, "user:1").Result()
+c.HIncrBy(ctx, "user:1", "score", 10)
+c.HIncrByFloat(ctx, "user:1", "balance", 1.5)
+```
+
+### List
+
+```go
+c.LPush(ctx, "list", "a", "b")
+c.RPush(ctx, "list", "c")
+v, _ := c.LPop(ctx, "list").Result()
+v, _ := c.RPop(ctx, "list").Result()
+items, _ := c.LRange(ctx, "list", 0, -1).Result() // -1 表示最后一个
+n, _ := c.LLen(ctx, "list").Result()
+c.LRem(ctx, "list", 1, "a")            // 移除 1 个等于 "a" 的元素
+v, _ := c.LIndex(ctx, "list", 0).Result()
+c.LTrim(ctx, "list", 0, 99)            // 只保留前 100 个
+```
+
+### Set
+
+```go
+c.SAdd(ctx, "tags", "go", "redis")
+members, _ := c.SMembers(ctx, "tags").Result()
+ok, _ := c.SIsMember(ctx, "tags", "go").Result()
+c.SRem(ctx, "tags", "redis")
+n, _ := c.SCard(ctx, "tags").Result()
+v, _ := c.SRandMember(ctx, "tags").Result() // 随机取（不删）
+v, _ := c.SPop(ctx, "tags").Result()        // 随机弹出（删）
+```
+
+### Sorted Set
+
+```go
+c.ZAdd(ctx, "rank", redis.Z{Score: 100, Member: "alice"})
+score, _ := c.ZScore(ctx, "rank", "alice").Result()
+i, _ := c.ZRank(ctx, "rank", "alice").Result()       // 升序排名，从 0 开始
+top, _ := c.ZRange(ctx, "rank", 0, 9).Result()       // 按排名升序
+top, _ = c.ZRevRange(ctx, "rank", 0, 9).Result()     // 逆序（ZRANGE REV，Redis>=6.2）
+hits, _ := c.ZRangeByScore(ctx, "rank", &redis.ZRangeBy{
+    Min: "60", Max: "100", Offset: 0, Count: 10,     // 按分值范围（Redis>=6.2）
+}).Result()
+c.ZRem(ctx, "rank", "alice")
+c.ZRemRangeByScore(ctx, "rank", "0", "59")
+n, _ := c.ZCard(ctx, "rank").Result()
+n, _ = c.ZCount(ctx, "rank", "60", "100").Result()
+c.ZIncrBy(ctx, "rank", 5, "alice")
+```
+
+### 批量删除与遍历
+
+```go
+// SCAN + UNLINK 批量删除：UNLINK 后台异步释放内存，大 value 不阻塞主线程。
+// pattern 自动拼前缀（"user:*" 实际匹配 "myapp:user:*"），返回删除总数。
+// 建议传带超时的 ctx 控制执行时间。
+deleted, err := c.DelByPattern(ctx, "user:*")
+
+// 裸 SCAN：match 拼前缀；注意返回的 key 已含前缀（见前缀机制一节）
+keys, cursor, err := c.Scan(ctx, 0, "user:*", 100).Result()
+```
+
+---
+
+## Pipeline 与事务
+
+`Pipeline()`（批量打包）与 `TxPipeline()`（MULTI/EXEC 事务）返回 go-redis 原生 `redis.Pipeliner`。**Pipeline 内的命令不会自动拼前缀**，用 `Key` / `Keys` 手动拼：
+
+```go
+p := c.MustSelectDB(0)
+pipe := p.Pipeline()
+get := pipe.Get(ctx, p.Key("user:1"))
+pipe.Del(ctx, p.Keys("k1", "k2")...)
+if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+    return err
+}
+val, _ := get.Result()
+```
+
+---
+
+## Lua 脚本
+
+keys 参数列表中的每个 key 自动拼前缀；脚本体内自行构造的 key 不受管：
+
+```go
+// 直接执行
+n, err := c.Eval(ctx, `return redis.call("incrby", KEYS[1], ARGV[1])`,
+    []string{"counter"}, 10).Int64()
+
+// 按 SHA 执行已缓存脚本
+n, err = c.EvalSha(ctx, sha1, []string{"counter"}, 10).Int64()
+
+// 推荐：*redis.Script 自动处理 NOSCRIPT 回退
+var script = redis.NewScript(`return redis.call("get", KEYS[1])`)
+v, err := c.EvalScript(ctx, script, []string{"k"}).Result()
+```
+
+---
 
 ## Pub/Sub
+
+Redis Pub/Sub 为 **at-most-once**：不落盘、不重投，订阅者断线期间的消息永久丢失。适合在线通知、缓存失效广播等"丢了无所谓"的场景；需要可靠投递请用 [Stream](#stream-消费组可靠消息)。
 
 ```go
 // 发布（channel 自动拼前缀）
@@ -123,11 +346,15 @@ err = c.ConsumePattern(ctx, func(m *redis.Message) {
 }, "events:*")
 
 // 裸订阅 / 模式订阅：返回 *redis.PubSub，调用方负责 Close
-sub := c.PSubscribe(ctx, "events:*")
+sub := c.Subscribe(ctx, "events:user")
+defer sub.Close()
+sub = c.PSubscribe(ctx, "events:*")
 defer sub.Close()
 ```
 
-注意：Redis Pub/Sub 为 at-most-once，断线期间消息会丢失；`Consume` 的 handler 串行执行以保证单频道顺序，耗时处理请投递到业务自有 worker。
+`Consume` / `ConsumePattern` 的 handler **串行执行**以保证单频道顺序，耗时处理请投递到业务自有 worker；handler panic 会被恢复，消费终止并以 error 返回。
+
+---
 
 ## 分布式锁
 
@@ -136,7 +363,7 @@ defer sub.Close()
 ```go
 lock, err := c.TryLock(ctx, "job:daily-report", 30*time.Second)
 if errors.Is(err, redisx.ErrLockNotObtained) {
-    return // 他人持有，按业务节奏稍后重试
+    return nil // 他人持有，按业务节奏稍后重试
 }
 if err != nil {
     return err
@@ -145,40 +372,120 @@ defer lock.Release(ctx)
 
 // 长任务期间显式续期；锁已失去返回 ErrLockLost
 if err := lock.Refresh(ctx, 30*time.Second); errors.Is(err, redisx.ErrLockLost) {
-    return // 锁已过期被他人接管，停止当前工作
+    return nil // 锁已过期被他人接管，停止当前工作
 }
 ```
 
-语义边界：非 RedLock，主从故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底；不提供 watchdog 自动续期（生命周期由业务显式管理）。
+要点与边界：
+
+- `TryLock` 非阻塞；需要阻塞等待时由调用方按业务节奏循环重试（库不内置轮询策略）。
+- `ttl` 必须大于 0——无 TTL 的锁等于死锁隐患。
+- `Release` / `Refresh` 在锁已过期或被他人重新获取时返回 `ErrLockLost`，且**不会影响他人的锁**。
+- 非 RedLock：主从异步复制下故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底。
+- 不提供 watchdog 自动续期，生命周期由业务显式管理。
+
+---
 
 ## Stream 消费组（可靠消息）
 
-Pub/Sub 是 at-most-once；需要可靠投递时使用 Stream 消费组（at-least-once）：
+Stream 是 Redis 内置的可靠消息队列（**at-least-once**）：消息持久化、消费组分摊、ACK 确认、pending 重投、死消费者接管。
+
+### 生产
 
 ```go
-// 生产
-c.XAdd(ctx, &redis.XAddArgs{Stream: "orders", Values: map[string]any{"id": 1001}})
+id, err := c.XAdd(ctx, &redis.XAddArgs{
+    Stream: "orders",                          // 自动拼前缀（不修改传入的 args）
+    MaxLen: 100000, Approx: true,              // 建议设置，控制流长度
+    Values: map[string]any{"order_id": 1001},
+}).Result()
+```
 
-// 受管消费：自动建组（MKSTREAM）、崩溃重启续传 pending、handler 返回 nil 即 XACK
+### 受管消费
+
+```go
 err := c.ConsumeStream(ctx, redisx.StreamConfig{
     Stream:   "orders",
     Group:    "billing",
     Consumer: "worker-1",                  // 组内唯一（如实例 ID）
+    BatchSize: 16,                         // 单次最多读取数，默认 16
+    Block:    5 * time.Second,             // 无消息时阻塞等待，默认 5s
     AutoClaimMinIdle: 30 * time.Second,    // 可选：接管死消费者闲置超时的消息
     OnError: func(m redis.XMessage, err error) {
         log.Printf("msg %s failed: %v", m.ID, err) // 库内无日志，失败感知交给业务
     },
 }, func(m redis.XMessage) error {
-    return process(m.Values) // 返回 error 则不确认，留在 pending 等待重投
+    return process(m.Values) // 返回 nil 即 XACK；返回 error 则留在 pending 等待重投
 })
-
-// 监控 pending 堆积（持续失败的消息会积压在这里）
-summary, err := c.XPending(ctx, "orders", "billing").Result()
 ```
 
-语义要点：handler 返回 error 的消息留在 pending（重启续传或被 AutoClaim 接管时重投），失败明细经 `OnError` 回调感知，堆积用 `XPending` / `XPendingExt` 监控；handler 串行执行保证顺序；panic 恢复后终止消费并以 error 返回；ctx 取消优雅退出。另透传 `XLen` / `XRange` / `XDel` / `XTrimMaxLen` 便于流的日常管理。
+`StreamConfig` 字段：
 
-## 外接熔断器（Hook 扩展点）
+| 字段               | 说明                                                                 | 默认    |
+| ------------------ | -------------------------------------------------------------------- | ------- |
+| `Stream`           | 流名，自动拼前缀（必填）                                             | —      |
+| `Group`            | 消费组名，不存在时自动创建（MKSTREAM）（必填）                       | —      |
+| `Consumer`         | 消费者名，组内应唯一（必填）                                         | —      |
+| `BatchSize`        | 单次 XREADGROUP 最多读取数                                           | 16      |
+| `Block`            | 无消息时阻塞等待时长（0 或负值取默认，无法表达无限阻塞）             | 5s      |
+| `AutoClaimMinIdle` | >0 时周期接管闲置超过该时长的他人 pending 消息（Redis>=6.2）；实际接管周期下限受 Block 钳制 | 0（关） |
+| `OnError`          | handler 业务失败时的同步回调，应保持轻量；回调 panic 终止消费        | nil     |
+
+生命周期语义：
+
+- 消费组不存在时自动创建；启动时先续传本消费者的 pending（崩溃重启不丢已读未确认的消息），再消费新消息。
+- handler **串行执行**保证顺序；panic 被恢复，消费终止并以 error 返回。
+- ctx 取消时返回 ctx 的错误（`errors.Is(err, context.Canceled)` 判断优雅退出）。
+
+### 失败处理与监控
+
+handler 返回 error 的消息**不会 ACK**，留在 pending：重启续传或被 AutoClaim 接管时重投。持续失败的消息会堆积，务必监控：
+
+```go
+// pending 摘要：总数、最小/最大 ID、各消费者的数量
+summary, err := c.XPending(ctx, "orders", "billing").Result()
+
+// pending 明细：按条件过滤（不修改传入的 args）
+details, err := c.XPendingExt(ctx, &redis.XPendingExtArgs{
+    Stream: "orders", Group: "billing",
+    Start: "-", End: "+", Count: 10,
+    Idle: time.Minute, // 只看闲置超过 1 分钟的
+}).Result()
+```
+
+### 管理命令
+
+```go
+n, _ := c.XLen(ctx, "orders").Result()                  // 流长度
+msgs, _ := c.XRange(ctx, "orders", "-", "+").Result()   // 按 ID 区间读取
+c.XAck(ctx, "orders", "billing", "1-0")                 // 手动确认
+c.XDel(ctx, "orders", "1-0")                            // 删除消息
+c.XTrimMaxLen(ctx, "orders", 100000)                    // 裁剪流长度
+```
+
+---
+
+## 监控与运维
+
+```go
+// 健康检查：PING 所有已初始化 DB，不短路，聚合返回全部失败；nil 表示全部健康
+if err := c.HealthCheck(ctx); err != nil {
+    log.Printf("redis unhealthy: %v", err)
+}
+
+// 连接池统计：按 DB 编号透传 go-redis PoolStats（命中/未命中/超时/连接数）
+for db, s := range c.PoolStats() {
+    metrics.Report(db, s.Hits, s.Misses, s.Timeouts, s.TotalConns, s.IdleConns)
+}
+
+// 优雅关闭：关闭所有 DB 连接池，多 DB 失败用 errors.Join 合并返回
+defer c.Close()
+```
+
+当前库版本经 `redisx.Version` 常量获取。
+
+---
+
+## Hook 扩展点（外接熔断 / 限流 / 观测）
 
 库本身不内置熔断 / 降级策略——这类决策属于业务层（回源数据库、返回兜底值还是直接报错，只有调用方知道）。库提供的是扩展点：`AddHook` 把任意 go-redis `redis.Hook` 一次性安装到**所有已初始化 DB** 的底层客户端上，可用于接入 gobreaker、sentinel-golang 等熔断库，或挂接限流、metrics、tracing 中间件。
 
@@ -222,61 +529,17 @@ c.AddHook(&breakerHook{cb: newBreaker()})
 - 只想对个别 DB 安装时，改用 `GetClient(db)` 拿到原生客户端后自行 `AddHook`。
 - 熔断快速失败时业务拿到的是熔断器返回的错误（如 gobreaker 的 `ErrOpenState`），可据此走降级分支（回源、兜底值等）。
 
-## 从 gtkit/redis 迁移
-
-### 从 v2（`github.com/gtkit/redis/v2`）迁移
-
-API 完全同构，仅改导入路径与包选择器：
-
-```go
-// 旧
-import "github.com/gtkit/redis/v2"
-c, err := redis.NewClient(redis.WithAddr("127.0.0.1:6379"))
-
-// 新
-import "github.com/gtkit/redisx"
-c, err := redisx.NewClient(redisx.WithAddr("127.0.0.1:6379"))
-```
-
-### 从 v1（`github.com/gtkit/redis`）迁移
-
-```go
-// v1：全局单例 + 手动拼前缀
-conn, err := redis.NewCollection(
-    redis.WithAddr("127.0.0.1:6379"),
-    redis.WithDB(0, "test"),
-    redis.WithDB(2, "prefix:test2"),
-)
-rdb := redis.Select(2)
-rdb.Client().Set(ctx, rdb.Prefix()+"key:2", "v", 0)
-
-// redisx：实例化 + 前缀自动拼接
-c, err := redisx.NewClient(
-    redisx.WithAddr("127.0.0.1:6379"),
-    redisx.WithDBConfig(0, "test"),
-    redisx.WithDBConfig(2, "prefix:test2"),
-)
-c.MustSelectDB(2).Set(ctx, "key:2", "v", 0) // 实际 key: "prefix:test2:key:2"
-```
-
-
-| v1                            | redisx                              |
-| ----------------------------- | ----------------------------------- |
-| `NewCollection(opts...)`      | `NewClient(opts...)`                |
-| `WithDB(db, prefix)`          | `WithDBConfig(db, prefix)`          |
-| `Select(db)`                  | `SelectDB(db)` / `MustSelectDB(db)` |
-| `Client(db)`                  | `GetClient(db)`                     |
-| `rdb.Prefix() + key` 手动拼接 | 自动拼接                            |
-| `BatchDel(ctx, pattern)`      | `DelByPattern(ctx, pattern)`        |
-
-注意两处行为差异：
-
-- v1 多库初始化是**部分成功**语义（失败的库缺席集合）；redisx 默认**全有或全无**，需要 v1 语义时启用 `WithAllowPartialInit()`。
-- v1 `BatchDel` 用逐 key DEL；redisx `DelByPattern` 用批量 UNLINK，返回值多了删除计数。
+---
 
 ## 并发安全
 
 `Client` 与 `Proxy` 在 `NewClient` 返回后内部状态只读，可在任意 goroutine 并发使用；底层 `*redis.Client` 由 go-redis 连接池保证并发安全。
+
+## 已知边界
+
+- 仅支持单实例 Redis，不支持 Cluster / Sentinel 拓扑（Cluster 协议无多 DB 概念，如有需求属独立特性）。
+- Pub/Sub 为 at-most-once；可靠投递请用 Stream。
+- 分布式锁为单实例语义（非 RedLock）。
 
 ## License
 
