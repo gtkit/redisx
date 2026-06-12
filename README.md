@@ -11,9 +11,9 @@
 - 完整连接池 / 超时配置（PoolSize、MinIdleConns、DialTimeout、ReadTimeout 等）
 - 支持 TLS 连接（`WithTLSConfig`，适配云厂商强制加密实例）
 - 可选降级初始化（`WithAllowPartialInit`），失败 DB 经 `InitError` 按编号提取
-- `Proxy` 命令代理覆盖 String / Hash / List / Set / ZSet / Pub-Sub / Stream / Lua / Pipeline，key 自动加前缀；`Client` 内嵌默认 DB 代理，全部命令直接可用
+- `Proxy` 代理 String / Hash / List / Set / ZSet / Pub-Sub / Stream / Lua / Pipeline 的**常用命令子集**（非全量 Redis 命令），key 自动加前缀；完整命令面经 `RawClient()` / `GetClient(db)` 直接使用 go-redis；`Client` 内嵌默认 DB 代理，全部代理命令直接可用
 - `Consume` / `ConsumePattern` 受管订阅消费，`ConsumeStream` 消费组可靠消费（at-least-once）
-- 单实例分布式锁：`TryLock` / `Release` / `Refresh`，Lua 校验 token 杜绝误删
+- 单实例分布式锁：`TryLock` / `Release` / `Refresh` / `TTL`，Lua 校验 token 杜绝误删
 - `DelByPattern`：SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
 - `HealthCheck` 健康检查、`PoolStats` 连接池统计透传，监控出口齐备
 - `AddHook` 一次调用为所有 DB 挂接 go-redis Hook，外接熔断 / 限流 / metrics / tracing
@@ -97,6 +97,9 @@ c, err := redisx.NewClient(
     redisx.WithInitDBs(0, 1, 2),
     redisx.WithAllowPartialInit(),
 )
+// ⚠️ 降级模式下 c 与 err 可同时非 nil！
+// 不要写惯用的 `if err != nil { return nil, err }`——那会把可用的 Client 丢掉。
+// 先用 errors.As 判断是否为部分失败，再决定降级使用还是拒绝启动。
 var ie *redisx.InitError
 if errors.As(err, &ie) {
     for db, cause := range ie.Failed {
@@ -134,7 +137,18 @@ c, err := redisx.NewClient(
 - `Pipeline()` / `TxPipeline()` 内的命令（见 [Pipeline 与事务](#pipeline-与事务)）；
 - Lua 脚本体内自行构造的 key（`Eval` 系列只对 keys 参数列表拼前缀）。
 
-**陷阱**：`Scan` 返回的 key **已含前缀**，直接回传给本库其他带前缀方法（如 `Del`）会二次拼接。继续操作请走 `RawClient`，批量删除直接用 `DelByPattern`。
+**陷阱**：`Scan` 返回的 key **已含前缀**，直接回传给本库其他带前缀方法（如 `Del`）会二次拼接。**遍历 key 请优先用 `ScanKeys`**——自动翻页且产出已剥前缀的 key，可直接回传：
+
+```go
+for key, err := range c.ScanKeys(ctx, "user:*") {
+    if err != nil {
+        return err
+    }
+    c.Del(ctx, key) // key 不含前缀，不会二次拼接
+}
+```
+
+批量删除直接用 `DelByPattern`。
 
 手动拼接工具（Pipeline 等场景）：
 
@@ -201,7 +215,16 @@ c.Decr(ctx, "counter")
 c.DecrBy(ctx, "counter", 10)
 
 vals, _ := c.MGet(ctx, "k1", "k2").Result()       // 批量取，缺失项为 nil
-c.MSet(ctx, "k1", "v1", "k2", "v2")               // 交替 key-value，长度必须为偶数
+c.MSet(ctx, "k1", "v1", "k2", "v2")               // 交替 key-value，长度必须为偶数且 key 位必须为 string
+```
+
+结构体值用 JSON 泛型助手（包级函数，`Client` 内嵌 `Proxy` 直接传）：
+
+```go
+redisx.SetJSON(ctx, c.Proxy, "user:1", User{Name: "alice"}, time.Hour)
+
+u, err := redisx.GetJSON[User](ctx, c.Proxy, "user:1")
+if errors.Is(err, redis.Nil) { /* key 不存在，u 为零值 */ }
 ```
 
 ### Key 管理
@@ -376,11 +399,26 @@ if err := lock.Refresh(ctx, 30*time.Second); errors.Is(err, redisx.ErrLockLost) 
 }
 ```
 
+更推荐的闭包模式——`WithLock` 封装"拿锁—执行—必释放"（含 panic 路径），消除漏 `Release` 风险：
+
+```go
+err := c.WithLock(ctx, "job:daily-report", 30*time.Second, func(ctx context.Context) error {
+    return doReport(ctx) // 预计耗时须显著小于 ttl
+})
+switch {
+case errors.Is(err, redisx.ErrLockNotObtained):
+    return nil // 他人持有，跳过本轮
+case errors.Is(err, redisx.ErrLockLost):
+    // fn 执行超过 ttl，互斥可能已被破坏——触发业务侧补偿/告警
+}
+```
+
 要点与边界：
 
-- `TryLock` 非阻塞；需要阻塞等待时由调用方按业务节奏循环重试（库不内置轮询策略）。
+- `TryLock` 非阻塞；需要阻塞等待时由调用方按业务节奏循环重试（库不内置轮询策略）。冲突错误用 `errors.Is(err, ErrLockNotObtained)` 判断，错误消息携带完整 key 便于排障。
 - `ttl` 必须大于 0——无 TTL 的锁等于死锁隐患。
 - `Release` / `Refresh` 在锁已过期或被他人重新获取时返回 `ErrLockLost`，且**不会影响他人的锁**。
+- 观测自检：`lock.Key()` 返回完整锁 key（供日志/打点）；`lock.TTL(ctx)` 校验 token 后原子返回剩余时长，锁已失去返回 `ErrLockLost`。注意 TTL 仅供观测——查询与后续操作之间锁仍可能过期，互斥正确性依赖 `Release`/`Refresh` 自身的 token 校验。
 - 非 RedLock：主从异步复制下故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底。
 - 不提供 watchdog 自动续期，生命周期由业务显式管理。
 
@@ -428,6 +466,8 @@ err := c.ConsumeStream(ctx, redisx.StreamConfig{
 | `BatchSize`        | 单次 XREADGROUP 最多读取数                                           | 16      |
 | `Block`            | 无消息时阻塞等待时长（0 或负值取默认，无法表达无限阻塞）             | 5s      |
 | `AutoClaimMinIdle` | >0 时周期接管闲置超过该时长的他人 pending 消息（Redis>=6.2）；实际接管周期下限受 Block 钳制 | 0（关） |
+| `MaxDeliver`       | >0 时启用死信策略：投递次数超过该值的消息转入死信流（即 handler 最多尝试 MaxDeliver 次） | 0（关） |
+| `DeadLetterStream` | 死信流名，自动拼前缀；`MaxDeliver > 0` 时必填且不得与 Stream 同名     | —      |
 | `OnError`          | handler 业务失败时的同步回调，应保持轻量；回调 panic 终止消费        | nil     |
 
 生命周期语义：
@@ -436,9 +476,34 @@ err := c.ConsumeStream(ctx, redisx.StreamConfig{
 - handler **串行执行**保证顺序；panic 被恢复，消费终止并以 error 返回。
 - ctx 取消时返回 ctx 的错误（`errors.Is(err, context.Canceled)` 判断优雅退出）。
 
+### 死信队列（毒消息隔离）
+
+默认失败消息无限重投。配置 `MaxDeliver` + `DeadLetterStream` 后，投递次数超限的毒消息被**原子**（Lua 内 XADD + XACK，无丢失/重复窗口）转入死信流，不再阻塞消费：
+
+```go
+err := c.ConsumeStream(ctx, redisx.StreamConfig{
+    Stream: "orders", Group: "billing", Consumer: "worker-1",
+    MaxDeliver:       5,            // handler 最多尝试 5 次
+    DeadLetterStream: "orders:dlq", // 第 6 次投递前转入死信流
+    OnError: func(m redis.XMessage, err error) {
+        if errors.Is(err, redisx.ErrMessageDeadLettered) {
+            alert("毒消息已隔离", m.ID) // 死信化事件经 OnError 通知
+        }
+    },
+}, handler)
+```
+
+死信消息保留原字段，并附加元数据：`_redisx_origin_stream`（原流）、`_redisx_origin_id`（原消息 ID）、`_redisx_deliveries`（投递次数）、`_redisx_dead_at`（死信时间，RFC3339）。
+
+边界：
+
+- 投递次数来自 Redis pending entry 的 delivery counter（重投/接管自增）；仅 pending 续传与 AutoClaim 路径检查，新消息热路径零额外开销。
+- 死信流的裁剪、监控、重放由业务负责，库内不做 MAXLEN 限制；重放时可按 `_redisx_origin_id` 幂等。
+- 业务侧手工 `XCLAIM ... JUSTID` 不自增计数，会让该次接管不计入 MaxDeliver。
+
 ### 失败处理与监控
 
-handler 返回 error 的消息**不会 ACK**，留在 pending：重启续传或被 AutoClaim 接管时重投。持续失败的消息会堆积，务必监控：
+handler 返回 error 的消息**不会 ACK**，留在 pending：重启续传或被 AutoClaim 接管时重投（启用死信策略时超限即隔离）。持续失败的消息会堆积，务必监控：
 
 ```go
 // pending 摘要：总数、最小/最大 ID、各消费者的数量
@@ -460,7 +525,16 @@ msgs, _ := c.XRange(ctx, "orders", "-", "+").Result()   // 按 ID 区间读取
 c.XAck(ctx, "orders", "billing", "1-0")                 // 手动确认
 c.XDel(ctx, "orders", "1-0")                            // 删除消息
 c.XTrimMaxLen(ctx, "orders", 100000)                    // 裁剪流长度
+
+// 组管理
+c.XGroupCreateMkStream(ctx, "orders", "billing", "$")   // 提前建组（只消费新消息）
+groups, _ := c.XInfoGroups(ctx, "orders").Result()      // 组状态
+cs, _ := c.XInfoConsumers(ctx, "orders", "billing").Result() // 消费者状态（发现死条目）
+c.XGroupDelConsumer(ctx, "orders", "billing", "pod-old") // 清理死亡消费者
+c.XGroupDestroy(ctx, "orders", "billing")               // 销毁组
 ```
+
+**消费者条目运维**：以实例 ID 做 Consumer 名时，滚动发布会在组内累积死亡消费者条目（AutoClaim 只接管消息、不删条目）。请在实例下线钩子或定期任务中用 `XInfoConsumers` 找出长期闲置者、`XGroupDelConsumer` 清理；其未确认消息会被丢弃，清理前确认 pending 已被接管。
 
 ---
 

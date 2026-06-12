@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -138,21 +140,26 @@ func (p *Proxy) MGet(ctx context.Context, keys ...string) *redis.SliceCmd {
 // MSet 批量设置 key-value 对。
 //
 // values 为交替的 key-value 序列: MSet(ctx, "k1", "v1", "k2", "v2")。
-// 偶数位（0, 2, 4...）的 string 参数作为 key 自动拼接前缀。
+// 偶数位（0, 2, 4...）必须为 string，作为 key 自动拼接前缀。
 //
-// values 长度必须为偶数，否则返回错误。
+// values 长度必须为偶数且 key 位必须为 string，否则返回错误。
 func (p *Proxy) MSet(ctx context.Context, values ...any) *redis.StatusCmd {
 	if len(values)%2 != 0 {
 		cmd := redis.NewStatusCmd(ctx)
-		cmd.SetErr(fmt.Errorf("redis: MSet requires even number of arguments, got %d", len(values)))
+		cmd.SetErr(fmt.Errorf("redisx: MSet requires even number of arguments, got %d", len(values)))
 		return cmd
 	}
 	prefixed := make([]any, len(values))
 	copy(prefixed, values)
 	for i := 0; i < len(prefixed); i += 2 {
-		if k, ok := prefixed[i].(string); ok {
-			prefixed[i] = p.key(k)
+		k, ok := prefixed[i].(string)
+		if !ok {
+			// 静默跳过前缀会让 key 落入无前缀命名空间且不可发现，必须报错
+			cmd := redis.NewStatusCmd(ctx)
+			cmd.SetErr(fmt.Errorf("redisx: MSet key at index %d must be string, got %T", i, prefixed[i]))
+			return cmd
 		}
+		prefixed[i] = p.key(k)
 	}
 	return p.rdb.MSet(ctx, prefixed...)
 }
@@ -546,13 +553,13 @@ func (p *Proxy) DelByPattern(ctx context.Context, pattern string) (int64, error)
 	for {
 		keys, nextCursor, err := p.rdb.Scan(ctx, cursor, fullPattern, scanBatchSize).Result()
 		if err != nil {
-			return totalDeleted, fmt.Errorf("redis: scan pattern=%q: %w", fullPattern, err)
+			return totalDeleted, fmt.Errorf("redisx: scan pattern=%q: %w", fullPattern, err)
 		}
 
 		if len(keys) > 0 {
 			deleted, err := p.rdb.Unlink(ctx, keys...).Result()
 			if err != nil {
-				return totalDeleted, fmt.Errorf("redis: unlink batch pattern=%q: %w", fullPattern, err)
+				return totalDeleted, fmt.Errorf("redisx: unlink batch pattern=%q: %w", fullPattern, err)
 			}
 			totalDeleted += deleted
 		}
@@ -564,6 +571,45 @@ func (p *Proxy) DelByPattern(ctx context.Context, pattern string) (int64, error)
 	}
 
 	return totalDeleted, nil
+}
+
+// ScanKeys 返回自动翻页的 key 迭代器，match 自动拼接前缀，
+// 产出的 key **已剥去前缀**，可直接回传本库其他带前缀方法：
+//
+//	for key, err := range p.ScanKeys(ctx, "user:*") {
+//	    if err != nil {
+//	        return err
+//	    }
+//	    p.Del(ctx, key) // key 不含前缀，不会二次拼接
+//	}
+//
+// SCAN 出错时迭代产出一次非 nil error 后终止；提前 break 立即停止翻页。
+// 一致性语义跟随 Redis SCAN：迭代期间新增/删除的 key 不保证快照视图。
+func (p *Proxy) ScanKeys(ctx context.Context, match string) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		fullMatch := p.key(match)
+		trim := ""
+		if p.prefix != "" {
+			trim = p.prefix + ":"
+		}
+		var cursor uint64
+		for {
+			keys, next, err := p.rdb.Scan(ctx, cursor, fullMatch, scanBatchSize).Result()
+			if err != nil {
+				yield("", fmt.Errorf("redisx: scan keys match=%q: %w", fullMatch, err))
+				return
+			}
+			for _, k := range keys {
+				if !yield(strings.TrimPrefix(k, trim), nil) {
+					return
+				}
+			}
+			cursor = next
+			if cursor == 0 {
+				return
+			}
+		}
+	}
 }
 
 // Scan 包装 SCAN 命令，match pattern 自动拼接前缀。

@@ -55,10 +55,13 @@ func NewClient(opts ...Option) (*Client, error) {
 	}
 
 	if cfg.Addr == "" {
-		return nil, errors.New("redis: addr is required")
+		return nil, errors.New("redisx: addr is required")
 	}
 	if cfg.DefaultDB < 0 {
-		return nil, fmt.Errorf("redis: invalid default db %d, must be >= 0", cfg.DefaultDB)
+		return nil, fmt.Errorf("redisx: invalid default db %d, must be >= 0", cfg.DefaultDB)
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 
 	// 收集并去重需要初始化的 DB，同时记录 per-DB 前缀
@@ -67,7 +70,7 @@ func NewClient(opts ...Option) (*Client, error) {
 	dbPrefixes[cfg.DefaultDB] = "" // DefaultDB 始终使用全局前缀
 	for _, dc := range cfg.InitDBs {
 		if dc.DB < 0 {
-			return nil, fmt.Errorf("redis: invalid db %d in init list, must be >= 0", dc.DB)
+			return nil, fmt.Errorf("redisx: invalid db %d in init list, must be >= 0", dc.DB)
 		}
 		// 后设置的 per-DB 前缀优先；如果已有条目且新条目有前缀则覆盖
 		if dc.Prefix != "" {
@@ -127,6 +130,12 @@ func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Cli
 		}
 	}
 
+	// 本库语义：MaxRetries=0 表示关闭重试；go-redis 中 0 是"默认 3 次"、-1 才是关闭
+	maxRetries := cfg.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = -1
+	}
+
 	for _, db := range order {
 		rdb := redis.NewClient(&redis.Options{
 			Addr:            cfg.Addr,
@@ -135,7 +144,7 @@ func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Cli
 			DB:              db,
 			PoolSize:        cfg.PoolSize,
 			MinIdleConns:    cfg.MinIdleConns,
-			MaxRetries:      cfg.MaxRetries,
+			MaxRetries:      maxRetries,
 			DialTimeout:     cfg.DialTimeout,
 			ReadTimeout:     cfg.ReadTimeout,
 			WriteTimeout:    cfg.WriteTimeout,
@@ -149,7 +158,7 @@ func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Cli
 		pingCancel()
 		if pingFail != nil {
 			_ = rdb.Close() // 关闭当前这个也要关
-			pingErr := fmt.Errorf("redis: ping db=%d addr=%s: %w", db, cfg.Addr, pingFail)
+			pingErr := fmt.Errorf("redisx: ping db=%d addr=%s: %w", db, cfg.Addr, pingFail)
 			// 降级模式下非默认 DB 失败只记录不中断；默认 DB 承载 Client 级快捷方法，必须成功
 			if cfg.AllowPartialInit && db != cfg.DefaultDB {
 				if failed == nil {
@@ -195,7 +204,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("redis: health check failed: %w", errors.Join(errs...))
+		return fmt.Errorf("redisx: health check failed: %w", errors.Join(errs...))
 	}
 	return nil
 }
@@ -208,7 +217,7 @@ func (c *Client) SelectDB(db int) (*Proxy, error) {
 		return p, nil
 	}
 	available := slices.Sorted(maps.Keys(c.proxies))
-	return nil, fmt.Errorf("redis: db=%d not initialized, available: %v", db, available)
+	return nil, fmt.Errorf("redisx: db=%d not initialized, available: %v", db, available)
 }
 
 // MustSelectDB 返回指定 DB 编号上的命令代理 [Proxy]。

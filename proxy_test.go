@@ -47,6 +47,18 @@ func TestProxyKeys(t *testing.T) {
 	}
 }
 
+func TestRawClient(t *testing.T) {
+	t.Parallel()
+
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	p := &Proxy{rdb: rdb, prefix: "app"}
+	if p.RawClient() != rdb {
+		t.Error("RawClient() 应返回底层 *redis.Client 本身")
+	}
+}
+
 func TestMSetOddArguments(t *testing.T) {
 	t.Parallel()
 
@@ -57,6 +69,19 @@ func TestMSetOddArguments(t *testing.T) {
 	}
 	if !strings.Contains(cmd.Err().Error(), "even number of arguments") {
 		t.Errorf("MSet 错误 = %q, 期望包含参数个数说明", cmd.Err().Error())
+	}
+}
+
+func TestMSetNonStringKey(t *testing.T) {
+	t.Parallel()
+
+	p := &Proxy{prefix: "app"}
+	cmd := p.MSet(t.Context(), []byte("k1"), "v1")
+	if cmd.Err() == nil {
+		t.Fatal("MSet 非 string key 期望返回错误，实际为 nil")
+	}
+	if !strings.Contains(cmd.Err().Error(), "must be string") || !strings.Contains(cmd.Err().Error(), "[]uint8") {
+		t.Errorf("MSet 错误 = %q, 期望包含类型说明", cmd.Err().Error())
 	}
 }
 

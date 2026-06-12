@@ -2,6 +2,7 @@ package redisx_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -160,4 +161,44 @@ func Example_migration() {
 	// redisx: 前缀自动拼接，业务层无感知
 	db2 := c.MustSelectDB(2)
 	db2.Set(ctx, "key:2", "value:2", 0) // 实际 key: "prefix:test2:key:2"
+}
+
+// ExampleGetJSON 演示结构体值的 JSON 读写助手与新增的人体工学 API。
+func ExampleGetJSON() {
+	c, err := redisx.NewClient(redisx.WithAddr("127.0.0.1:6379"), redisx.WithKeyPrefix("app"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx := context.Background()
+
+	type User struct {
+		Name string `json:"name"`
+		Age  int    `json:"age"`
+	}
+
+	// 结构体读写：Client 内嵌 Proxy，直接传 c.Proxy
+	_ = redisx.SetJSON(ctx, c.Proxy, "user:1", User{Name: "alice", Age: 18}, time.Hour)
+	u, err := redisx.GetJSON[User](ctx, c.Proxy, "user:1")
+	if errors.Is(err, goredis.Nil) {
+		fmt.Println("user not found")
+	}
+	_ = u
+
+	// 闭包持锁执行：拿锁—执行—必释放
+	err = c.WithLock(ctx, "job:report", 30*time.Second, func(context.Context) error {
+		return nil // 业务逻辑
+	})
+	if errors.Is(err, redisx.ErrLockNotObtained) {
+		fmt.Println("他人持有，跳过本轮")
+	}
+
+	// 遍历 key：产出已剥前缀，可直接回传
+	for key, err := range c.ScanKeys(ctx, "user:*") {
+		if err != nil {
+			log.Fatal(err)
+		}
+		c.Del(ctx, key)
+	}
 }

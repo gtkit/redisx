@@ -15,6 +15,29 @@ const (
 	defaultStreamBlock = 5 * time.Second
 )
 
+// ErrMessageDeadLettered 表示消息投递次数超过 MaxDeliver，已被转入死信流。
+// 经 [StreamConfig.OnError] 通知业务时可 errors.Is 判别。
+var ErrMessageDeadLettered = errors.New("redisx: message dead-lettered")
+
+// 死信消息附加的元数据字段名（下划线前缀避让业务字段）。
+const (
+	deadLetterFieldOriginStream = "_redisx_origin_stream"
+	deadLetterFieldOriginID     = "_redisx_origin_id"
+	deadLetterFieldDeliveries   = "_redisx_deliveries"
+	deadLetterFieldDeadAt       = "_redisx_dead_at"
+)
+
+// deadLetterScript 原子完成"写死信流 + ACK 原消息"，消除两步间崩溃导致的
+// 死信丢失或重复窗口。KEYS[1]=源流，KEYS[2]=死信流；ARGV[1]=group，
+// ARGV[2]=原消息 ID，ARGV[3..]=死信消息的 field-value 序列。
+var deadLetterScript = redis.NewScript(`
+local fields = {}
+for i = 3, #ARGV do
+	fields[#fields+1] = ARGV[i]
+end
+redis.call("xadd", KEYS[2], "*", unpack(fields))
+return redis.call("xack", KEYS[1], ARGV[1], ARGV[2])`)
+
 // StreamConfig 定义 [Proxy.ConsumeStream] 受管消费组的配置。
 type StreamConfig struct {
 	// Stream 是流名，自动拼接前缀。必填。
@@ -40,9 +63,27 @@ type StreamConfig struct {
 	// 实际接管周期下限受 Block 钳制，设置小于 Block 的值没有意义。
 	AutoClaimMinIdle time.Duration
 
+	// MaxDeliver 大于 0 时启用死信策略：投递次数（Redis pending entry 的
+	// delivery counter，每次投递/接管自增）超过该值的消息不再交给 handler，
+	// 原子转入 DeadLetterStream 并 ACK。0 表示关闭（失败消息无限重投）。
+	//
+	// 语义即"handler 最多尝试 MaxDeliver 次"。仅 pending 续传与 AutoClaim
+	// 路径检查（新消息首次投递必然未超限），新消息热路径零额外开销。
+	MaxDeliver int64
+
+	// DeadLetterStream 是死信流名，自动拼接前缀。MaxDeliver > 0 时必填，
+	// 且不得与 Stream 同名。死信消息保留原消息全部字段，并附加
+	// _redisx_origin_stream / _redisx_origin_id / _redisx_deliveries /
+	// _redisx_dead_at 元数据。死信流的裁剪、监控与重放由业务负责，
+	// 库内不做 MAXLEN 限制——无人消费时请业务侧自行 XTrimMaxLen。
+	DeadLetterStream string
+
 	// OnError 可选：handler 返回业务 error 时被同步调用（此时消息不 ACK，
 	// 留在 pending 等待重投）。库内不产生日志，这是业务感知"哪条消息为何
 	// 失败"的口子；nil 表示静默（仅靠 XPENDING 监控）。
+	//
+	// 消息被死信化时同样经本回调通知，err 满足
+	// errors.Is(err, ErrMessageDeadLettered)。
 	//
 	// 回调在消费 goroutine 内执行，应保持轻量（记日志/打点）；
 	// 回调内 panic 会终止消费并以 error 返回。
@@ -58,6 +99,17 @@ func (cfg *StreamConfig) validate() error {
 	}
 	if cfg.Consumer == "" {
 		return errors.New("redisx: stream config: Consumer is required")
+	}
+	if cfg.MaxDeliver < 0 {
+		return fmt.Errorf("redisx: stream config: MaxDeliver must be >= 0, got %d", cfg.MaxDeliver)
+	}
+	if cfg.MaxDeliver > 0 {
+		if cfg.DeadLetterStream == "" {
+			return errors.New("redisx: stream config: DeadLetterStream is required when MaxDeliver > 0")
+		}
+		if cfg.DeadLetterStream == cfg.Stream {
+			return fmt.Errorf("redisx: stream config: DeadLetterStream must differ from Stream %q", cfg.Stream)
+		}
 	}
 	return nil
 }
@@ -100,6 +152,42 @@ func (p *Proxy) XTrimMaxLen(ctx context.Context, stream string, maxLen int64) *r
 	return p.rdb.XTrimMaxLen(ctx, p.key(stream), maxLen)
 }
 
+// XGroupCreateMkStream 创建消费组，流不存在时一并创建（MKSTREAM）。
+// stream 自动拼接前缀。start 为起始 ID（"0" 从头，"$" 只消费新消息）。
+//
+// [Proxy.ConsumeStream] 会自动建组，本方法用于需要提前建组或自定义
+// 起始位置的场景。组已存在时 Redis 返回 BUSYGROUP 错误。
+func (p *Proxy) XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd {
+	return p.rdb.XGroupCreateMkStream(ctx, p.key(stream), group, start)
+}
+
+// XGroupDestroy 销毁消费组（含全部 pending 状态）。stream 自动拼接前缀。
+func (p *Proxy) XGroupDestroy(ctx context.Context, stream, group string) *redis.IntCmd {
+	return p.rdb.XGroupDestroy(ctx, p.key(stream), group)
+}
+
+// XGroupDelConsumer 从消费组中删除指定消费者，返回其被丢弃的 pending 数。
+// stream 自动拼接前缀。
+//
+// 以实例 ID 做 Consumer 名时，滚动发布会在组内累积死亡消费者条目，
+// 请在实例下线或定期任务中调用本方法清理；其未确认的消息会被丢弃，
+// 清理前请确认 pending 已被 AutoClaim 接管或确认完毕（见 [Proxy.XPendingExt]）。
+func (p *Proxy) XGroupDelConsumer(ctx context.Context, stream, group, consumer string) *redis.IntCmd {
+	return p.rdb.XGroupDelConsumer(ctx, p.key(stream), group, consumer)
+}
+
+// XInfoGroups 返回流上全部消费组的状态（consumer 数、pending 数、last-delivered-id 等）。
+// stream 自动拼接前缀。
+func (p *Proxy) XInfoGroups(ctx context.Context, stream string) *redis.XInfoGroupsCmd {
+	return p.rdb.XInfoGroups(ctx, p.key(stream))
+}
+
+// XInfoConsumers 返回消费组内全部消费者的状态（pending 数、闲置时长等），
+// 用于发现待清理的死亡消费者。stream 自动拼接前缀。
+func (p *Proxy) XInfoConsumers(ctx context.Context, stream, group string) *redis.XInfoConsumersCmd {
+	return p.rdb.XInfoConsumers(ctx, p.key(stream), group)
+}
+
 // XPending 返回消费组的 pending 摘要（总数、最小/最大 ID、各消费者数量）。
 // stream 自动拼接前缀。用于监控 handler 持续失败导致的消息堆积。
 func (p *Proxy) XPending(ctx context.Context, stream, group string) *redis.XPendingCmd {
@@ -130,7 +218,14 @@ func (p *Proxy) XPendingExt(ctx context.Context, args *redis.XPendingExtArgs) *r
 // handler panic 会被恢复，消费终止并以 error 返回。handler 串行执行以保证消息顺序。
 // ctx 取消时返回 ctx 的错误（errors.Is(err, context.Canceled) 判断优雅退出）。
 //
-// 持续失败的消息会堆积在 pending，请业务侧用 [Proxy.XPending] 监控。
+// 持续失败的消息默认堆积在 pending（请业务侧用 [Proxy.XPending] 监控）；
+// 配置 [StreamConfig.MaxDeliver] + [StreamConfig.DeadLetterStream] 可在
+// 投递超限后将毒消息原子隔离到死信流，不再阻塞重投。
+//
+// 库内不提供 handler 超时控制（Go 无法安全中断不配合的函数），长耗时处理
+// 请在 handler 内自行用 context 控制；[StreamConfig.OnError] 回调中如需
+// stream/group/consumer 上下文，闭包捕获自己构造的 StreamConfig 即可，
+// 消息 ID 在回调参数 msg.ID 中。
 func (p *Proxy) ConsumeStream(ctx context.Context, cfg StreamConfig, handler func(redis.XMessage) error) error {
 	if handler == nil {
 		return errors.New("redisx: stream handler is nil")
@@ -152,16 +247,21 @@ func (p *Proxy) ConsumeStream(ctx context.Context, cfg StreamConfig, handler fun
 	}
 
 	sc := &streamConsumer{rdb: p.rdb, cfg: cfg, stream: stream, handler: handler}
+	if cfg.MaxDeliver > 0 {
+		sc.dlStream = p.key(cfg.DeadLetterStream)
+	}
 	return sc.run(ctx)
 }
 
 // streamConsumer 承载一次 ConsumeStream 的消费循环状态。
 type streamConsumer struct {
-	rdb       *redis.Client
-	cfg       StreamConfig
-	stream    string
-	handler   func(redis.XMessage) error
-	lastClaim time.Time
+	rdb         *redis.Client
+	cfg         StreamConfig
+	stream      string
+	handler     func(redis.XMessage) error
+	lastClaim   time.Time
+	claimCursor string // XAUTOCLAIM 游标，周期间续扫；空值等价 "0"（从头）
+	dlStream    string // 已拼前缀的死信流名；空表示死信策略关闭
 }
 
 func (s *streamConsumer) run(ctx context.Context) error {
@@ -186,6 +286,10 @@ func (s *streamConsumer) run(ctx context.Context) error {
 			}
 			// 显式 ID 推进，避免对持续失败的消息无限重读
 			readID = msgs[len(msgs)-1].ID
+			// 续传的是重投消息，检查投递次数并隔离超限者
+			if msgs, err = s.filterDeadLetters(ctx, msgs); err != nil {
+				return err
+			}
 		}
 
 		for _, m := range msgs {
@@ -248,26 +352,104 @@ func (s *streamConsumer) handle(ctx context.Context, m redis.XMessage) error {
 }
 
 // maybeAutoClaim 按 AutoClaimMinIdle 周期接管其他消费者的超时 pending 消息。
+//
+// 周期间使用 XAUTOCLAIM 返回的游标续扫，避免大量 pending 时每次全量重扫；
+// 扫完一轮 Redis 返回 "0-0"，作为下次 Start 等价于从头开始新一轮。
 func (s *streamConsumer) maybeAutoClaim(ctx context.Context) error {
 	if s.cfg.AutoClaimMinIdle <= 0 || time.Since(s.lastClaim) < s.cfg.AutoClaimMinIdle {
 		return nil
 	}
 	s.lastClaim = time.Now()
 
-	msgs, _, err := s.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+	start := s.claimCursor
+	if start == "" {
+		start = "0"
+	}
+	msgs, next, err := s.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream:   s.stream,
 		Group:    s.cfg.Group,
 		Consumer: s.cfg.Consumer,
 		MinIdle:  s.cfg.AutoClaimMinIdle,
-		Start:    "0",
+		Start:    start,
 		Count:    s.cfg.BatchSize,
 	}).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("redisx: xautoclaim stream=%q: %w", s.stream, err)
 	}
+	s.claimCursor = next
+	// 接管的是重投消息，检查投递次数并隔离超限者
+	if msgs, err = s.filterDeadLetters(ctx, msgs); err != nil {
+		return err
+	}
 	for _, m := range msgs {
 		if err := s.handle(ctx, m); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// filterDeadLetters 按 MaxDeliver 过滤一批重投消息：投递次数超限者原子转入
+// 死信流并 ACK（不再交给 handler），其余原样返回。策略关闭或空批次时为 no-op。
+//
+// 投递次数来自 pending entry 的 delivery counter（XPENDING 明细），按本批
+// ID 区间一次查询摊薄成本；新消息（">"）路径不调用本方法，热路径零开销。
+func (s *streamConsumer) filterDeadLetters(ctx context.Context, msgs []redis.XMessage) ([]redis.XMessage, error) {
+	if s.dlStream == "" || len(msgs) == 0 {
+		return msgs, nil
+	}
+
+	pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: s.stream,
+		Group:  s.cfg.Group,
+		Start:  msgs[0].ID,
+		End:    msgs[len(msgs)-1].ID,
+		Count:  int64(len(msgs)),
+	}).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("redisx: xpending stream=%q: %w", s.stream, err)
+	}
+	deliveries := make(map[string]int64, len(pending))
+	for _, pe := range pending {
+		deliveries[pe.ID] = pe.RetryCount
+	}
+
+	kept := msgs[:0]
+	for _, m := range msgs {
+		n := deliveries[m.ID]
+		if n <= s.cfg.MaxDeliver {
+			kept = append(kept, m)
+			continue
+		}
+		if err := s.deadLetter(ctx, m, n); err != nil {
+			return nil, err
+		}
+	}
+	return kept, nil
+}
+
+// deadLetter 将消息原子转入死信流并 ACK 原消息，随后经 OnError 通知业务。
+func (s *streamConsumer) deadLetter(ctx context.Context, m redis.XMessage, deliveries int64) error {
+	args := make([]any, 0, 2+2*4+2*len(m.Values))
+	args = append(args,
+		s.cfg.Group, m.ID,
+		deadLetterFieldOriginStream, s.stream,
+		deadLetterFieldOriginID, m.ID,
+		deadLetterFieldDeliveries, deliveries,
+		deadLetterFieldDeadAt, time.Now().UTC().Format(time.RFC3339),
+	)
+	for k, v := range m.Values {
+		args = append(args, k, v)
+	}
+
+	if err := deadLetterScript.Run(ctx, s.rdb, []string{s.stream, s.dlStream}, args...).Err(); err != nil {
+		return fmt.Errorf("redisx: dead-letter stream=%q id=%s: %w", s.stream, m.ID, err)
+	}
+	if s.cfg.OnError != nil {
+		notify := fmt.Errorf("redisx: message id=%s dead-lettered to %q after %d deliveries: %w",
+			m.ID, s.dlStream, deliveries, ErrMessageDeadLettered)
+		if pe := safeOnError(s.cfg.OnError, m, notify); pe != nil {
+			return pe
 		}
 	}
 	return nil

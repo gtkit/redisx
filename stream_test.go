@@ -26,6 +26,21 @@ func TestConsumeStreamValidation(t *testing.T) {
 		{"缺Stream", StreamConfig{Group: "g", Consumer: "c"}, "Stream is required"},
 		{"缺Group", StreamConfig{Stream: "s", Consumer: "c"}, "Group is required"},
 		{"缺Consumer", StreamConfig{Stream: "s", Group: "g"}, "Consumer is required"},
+		{
+			"MaxDeliver为负",
+			StreamConfig{Stream: "s", Group: "g", Consumer: "c", MaxDeliver: -1},
+			"MaxDeliver must be >= 0",
+		},
+		{
+			"启用死信缺死信流",
+			StreamConfig{Stream: "s", Group: "g", Consumer: "c", MaxDeliver: 3},
+			"DeadLetterStream is required",
+		},
+		{
+			"死信流与源流同名",
+			StreamConfig{Stream: "s", Group: "g", Consumer: "c", MaxDeliver: 3, DeadLetterStream: "s"},
+			"must differ from Stream",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -2,8 +2,15 @@ package redisx
 
 import (
 	"crypto/tls"
+	"fmt"
+	"strings"
 	"time"
 )
+
+// globChars 是 Redis MATCH 模式的元字符。前缀会拼入 DelByPattern / Scan
+// 的 MATCH 模式，含元字符将改写匹配语义（最坏情况批量误删他人 key），
+// 因此前缀中一律禁止。
+const globChars = `*?[]\`
 
 // DBConfig 定义单个 DB 的配置（编号 + 可选独立前缀）。
 //
@@ -26,7 +33,8 @@ type Config struct {
 	// Password 是 Redis 认证密码。空字符串表示无需认证。
 	Password string
 
-	// DefaultDB 是默认使用的数据库编号（0~15），默认 0。
+	// DefaultDB 是默认使用的数据库编号，默认 0。
+	// 上限取决于服务端 databases 配置（默认 16 个库即 0~15），越界在初始化 Ping 时报错。
 	DefaultDB int
 
 	// InitDBs 是初始化时需要创建连接的 DB 配置列表。
@@ -81,6 +89,48 @@ func defaultConfig() *Config {
 	}
 }
 
+// validate 对池、重试、超时配置做防御校验，非法值 fail-fast 返回错误。
+//
+// go-redis 对 0/-1/-2 等哨兵值有各自的特殊语义（如 MaxRetries=0 表示默认 3 次、
+// ReadTimeout=-1 表示无超时），本库不透传这些哨兵：非法值在 NewClient 即报错，
+// 需要哨兵语义的场景请通过 [Client.GetClient] 直接操作 go-redis。
+func (c *Config) validate() error {
+	if c.PoolSize <= 0 {
+		return fmt.Errorf("redisx: pool size must be > 0, got %d", c.PoolSize)
+	}
+	if c.MinIdleConns < 0 {
+		return fmt.Errorf("redisx: min idle conns must be >= 0, got %d", c.MinIdleConns)
+	}
+	if c.MinIdleConns > c.PoolSize {
+		return fmt.Errorf("redisx: min idle conns (%d) must not exceed pool size (%d)", c.MinIdleConns, c.PoolSize)
+	}
+	if c.MaxRetries < 0 {
+		return fmt.Errorf("redisx: max retries must be >= 0, got %d", c.MaxRetries)
+	}
+	for _, tc := range []struct {
+		name string
+		d    time.Duration
+	}{
+		{"dial timeout", c.DialTimeout},
+		{"read timeout", c.ReadTimeout},
+		{"write timeout", c.WriteTimeout},
+		{"idle timeout", c.IdleTimeout},
+	} {
+		if tc.d <= 0 {
+			return fmt.Errorf("redisx: %s must be > 0, got %v", tc.name, tc.d)
+		}
+	}
+	if strings.ContainsAny(c.KeyPrefix, globChars) {
+		return fmt.Errorf("redisx: key prefix %q must not contain glob characters (%s)", c.KeyPrefix, globChars)
+	}
+	for _, dc := range c.InitDBs {
+		if strings.ContainsAny(dc.Prefix, globChars) {
+			return fmt.Errorf("redisx: db=%d prefix %q must not contain glob characters (%s)", dc.DB, dc.Prefix, globChars)
+		}
+	}
+	return nil
+}
+
 // Option 是 Functional Options 模式的配置函数。
 type Option func(*Config)
 
@@ -101,7 +151,10 @@ func WithPassword(password string) Option {
 	return func(c *Config) { c.Password = password }
 }
 
-// WithDB 设置默认使用的数据库编号（0~15）。
+// WithDB 设置默认使用的数据库编号。
+//
+// 编号必须 >= 0；上限取决于服务端 databases 配置（默认 16 个库即 0~15），
+// 越界的编号在 [NewClient] 初始化 Ping 时由 Redis 报错。
 func WithDB(db int) Option {
 	return func(c *Config) { c.DefaultDB = db }
 }
@@ -143,6 +196,9 @@ func WithMinIdleConns(n int) Option {
 }
 
 // WithMaxRetries 设置命令失败后最大重试次数。
+//
+// n 为 0 表示关闭自动重试（库内会映射为 go-redis 的 -1 哨兵值），
+// 负值在 [NewClient] 返回错误。
 //
 // 注意：对非幂等命令（如 INCR、LPUSH），读超时后的自动重试可能导致
 // 命令被重复执行。对此类命令敏感的场景请设置为 0 关闭重试，

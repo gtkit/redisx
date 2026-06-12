@@ -31,6 +31,13 @@ if redis.call("get", KEYS[1]) == ARGV[1] then
 end
 return 0`)
 
+// ttlScript 校验 token 匹配后原子返回剩余 TTL（毫秒）；不匹配返回 -3 哨兵。
+var ttlScript = redis.NewScript(`
+if redis.call("get", KEYS[1]) == ARGV[1] then
+	return redis.call("pttl", KEYS[1])
+end
+return -3`)
+
 // Lock 表示一把已持有的单实例分布式锁，由 [Proxy.TryLock] 获取。
 //
 // 注意语义边界：这是单 Redis 实例锁（非 RedLock），主从异步复制下
@@ -63,9 +70,77 @@ func (p *Proxy) TryLock(ctx context.Context, key string, ttl time.Duration) (*Lo
 		return nil, fmt.Errorf("redisx: try lock key=%q: %w", fullKey, err)
 	}
 	if !ok {
-		return nil, ErrLockNotObtained
+		return nil, fmt.Errorf("redisx: lock key=%q held by another: %w", fullKey, ErrLockNotObtained)
 	}
 	return &Lock{rdb: p.rdb, key: fullKey, token: token}, nil
+}
+
+// WithLock 获取锁后执行 fn，并保证释放（含 fn panic 路径），消除手写
+// TryLock + defer Release 样板与漏释放风险。key 自动拼接前缀。
+//
+// 锁被他人持有时返回 [ErrLockNotObtained]（errors.Is 判断），fn 不执行；
+// fn 的错误原样传出；释放阶段发现锁已失去（fn 执行超过 ttl，互斥可能已被
+// 破坏）时 [ErrLockLost] 经 [errors.Join] 并入返回错误——调用方应检查
+// errors.Is(err, ErrLockLost) 并触发业务侧补偿。fn panic 时锁仍被释放，
+// panic 继续向上传播。
+//
+// 不做自动续期：fn 预计耗时必须显著小于 ttl，长任务请自行分段或在 fn 内
+// 通过 [Proxy.TryLock] 返回的 Lock 显式 Refresh。
+func (p *Proxy) WithLock(ctx context.Context, key string, ttl time.Duration, fn func(ctx context.Context) error) error {
+	if fn == nil {
+		return errors.New("redisx: with lock fn is nil")
+	}
+	lock, err := p.TryLock(ctx, key, ttl)
+	if err != nil {
+		return err
+	}
+
+	// 释放动作不随外层 ctx 取消：fn 因 ctx 取消失败时锁也应立即归还，
+	// 而不是占到 ttl 自然过期
+	releaseCtx := context.WithoutCancel(ctx)
+
+	var fnErr error
+	func() {
+		defer func() {
+			// panic 路径也要释放锁，避免 ttl 内死锁；随后继续传播 panic
+			if r := recover(); r != nil {
+				_ = lock.Release(releaseCtx)
+				panic(r)
+			}
+		}()
+		fnErr = fn(ctx)
+	}()
+
+	relErr := lock.Release(releaseCtx)
+	if relErr == nil {
+		return fnErr // 常规路径：fn 错误原样传出，不被 Join 包装
+	}
+	return errors.Join(fnErr, relErr)
+}
+
+// Key 返回已拼前缀的完整锁 key，供日志、打点等观测场景使用。
+func (l *Lock) Key() string {
+	return l.key
+}
+
+// TTL 返回锁的剩余存活时间（校验 token 后原子读取）。
+//
+// 返回 nil error 即表示锁仍被当前持有者持有；锁已过期或被他人重新获取
+// 返回 [ErrLockLost]。仅供观测与业务自检：查询与后续操作之间锁仍可能
+// 过期，互斥正确性依赖 Release/Refresh 自身的 token 校验，而非本方法。
+func (l *Lock) TTL(ctx context.Context) (time.Duration, error) {
+	n, err := ttlScript.Run(ctx, l.rdb, []string{l.key}, l.token).Int64()
+	if err != nil {
+		return 0, fmt.Errorf("redisx: lock ttl key=%q: %w", l.key, err)
+	}
+	if n == -3 {
+		return 0, ErrLockLost
+	}
+	if n < 0 {
+		// -1：key 存在但无过期时间，本库的锁不会出现；防御性归零
+		return 0, nil
+	}
+	return time.Duration(n) * time.Millisecond, nil
 }
 
 // Release 释放锁。仅当锁仍被当前持有者持有（token 匹配）时删除；

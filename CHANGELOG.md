@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 JSON 泛型助手 `GetJSON[T]` / `SetJSON`：消除结构体值读写的 Marshal/Unmarshal 样板，key 不存在透传 `redis.Nil`
+
+- Stream 消费组新增死信策略：`StreamConfig.MaxDeliver` + `DeadLetterStream`，投递超限的毒消息经 Lua 原子（XADD + XACK 无丢失/重复窗口）转入死信流并附 `_redisx_*` 元数据，死信化事件经 `OnError` 以 `ErrMessageDeadLettered` 通知；默认关闭，行为不变
+
+- 新增 `Proxy.WithLock(ctx, key, ttl, fn)`：闭包持锁执行，保证释放（含 panic 与 ctx 取消路径），fn 超 TTL 丢锁时 `ErrLockLost` 并入返回错误可感知
+- 新增 `Proxy.ScanKeys(ctx, match)`：自动翻页的 `iter.Seq2[string, error]` 迭代器，产出已剥前缀的 key，结构性消除 `Scan` 的双重拼接陷阱
+- 新增消费组管理命令透传（stream 自动拼前缀）：`XGroupCreateMkStream` / `XGroupDestroy` / `XGroupDelConsumer` / `XInfoGroups` / `XInfoConsumers`，README 补充死亡消费者清理运维指引
+
+- 新增 GitHub Actions CI：真实 Redis service container 下跑 `go vet` + `go test -race` + 覆盖率 ≥ 80% 门槛 + benchmark 冒烟 + golangci-lint，质量门自动化执行
+
+- 新增 `Lock.Key()`（返回已拼前缀的完整锁 key，供日志/打点）与 `Lock.TTL(ctx)`（Lua 校验 token 后原子返回剩余 TTL，锁已失去返回 `ErrLockLost`；仅供观测自检，互斥正确性仍依赖 Release/Refresh 的 token 校验）
+
+- `NewClient` 增加配置防御校验（fail-fast）：`PoolSize` 必须 > 0、`MinIdleConns` 必须在 [0, PoolSize] 内、`MaxRetries` 必须 >= 0、四个超时（Dial/Read/Write/Idle）必须 > 0，非法值在拨号前报错并包含字段名与实际值；go-redis 的 0/-1/-2 哨兵语义不再透传
+- 新增真实 Redis 集成测试（`REDISX_TEST_ADDR` 可覆盖地址，默认 127.0.0.1:6379，不可达时 skip）：覆盖 Client 生命周期、全部命令代理与前缀拼接、分布式锁互斥 / 过期 / 续期 / token 防误删、Stream 消费组创建 / ACK / pending 续传 / AutoClaim 接管 / ctx 取消，整体覆盖率约 95%
+- 新增 `benchmark_test.go`：prefixKey / Keys 纯函数、Set / Get 命令包装、DelByPattern、Stream XAdd 与生产消费链路基准
+
+### Fixed
+
+- 修复 `WithMaxRetries(0)` 与文档承诺不符的问题：此前 0 被 go-redis 解释为"默认 3 次重试"，现库内映射为 -1，0 真正表示关闭自动重试
+- 修复 `ConsumeStream` 的 AutoClaim 每个周期都从 "0" 全量重扫 pending 的低效问题：现保存 XAUTOCLAIM 返回的游标周期间续扫，扫完一轮自动回绕
+
+### Changed
+
+- **行为变化（边缘 BREAKING）**：此前传入非法配置（如 `WithPoolSize(-1)`、`WithReadTimeout(0)`）仍能创建客户端，升级后 `NewClient` 返回配置校验错误
+- **行为变化（边缘 BREAKING）**：`KeyPrefix` / per-DB 前缀含 glob 元字符（`*?[]\`）时 `NewClient` 报错——前缀会拼入 `DelByPattern`/`Scan` 的 MATCH 模式，含元字符存在批量误删风险，此前是静默隐患
+- **行为变化（边缘 BREAKING）**：`MSet` 偶数位（key 位）传非 string 参数现在返回错误——此前静默跳过前缀拼接，key 落入无前缀命名空间且不可发现
+- 包内错误消息前缀统一为 `redisx:`（此前 `client.go`/`config.go`/`proxy.go` 用 `redis:`，与 go-redis 自身错误难以区分）；`TryLock` 冲突错误现包装完整 key 上下文——错误链（`errors.Is/As`）均不受影响，仅依赖子串匹配错误文本的调用方需注意
+- 文档修正：DB 编号上限说明改为"取决于服务端 databases 配置"（不再写死 0~15）；README 明确 `Proxy` 为常用命令子集、完整命令面走 `RawClient`；`ConsumeStream` 文档补充 handler 超时与 `OnError` 上下文的业务侧指引
+
 ## [1.1.1] - 2026-06-11
 
 ### Changed
