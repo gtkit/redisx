@@ -5,6 +5,7 @@
 //   - 无全局变量，支持多实例（多服务器/多配置）共存
 //   - 全局 Key 前缀透明封装，业务层无感知
 //   - 支持 per-DB 独立前缀
+//   - Pub/Sub channel 前缀独立配置，默认不复用 key 前缀
 //   - 完整连接池/超时配置（PoolSize、DialTimeout、ReadTimeout 等）
 //   - 支持 TLS 连接（WithTLSConfig）
 //   - 可选降级初始化（WithAllowPartialInit，失败 DB 缺席集合、错误聚合返回）

@@ -14,13 +14,16 @@ import (
 // Proxy 是对单个 DB 的 [*redis.Client] 命令代理。
 //
 // 所有带 key 参数的方法会自动拼接前缀（全局或 per-DB），对业务层透明。
+// Pub/Sub channel 使用独立 channel 前缀；默认不复用 key 前缀。
 // 通过 [Client.SelectDB] / [Client.MustSelectDB] 获取。
 //
 // Proxy 在 [NewClient] 中按 DB 缓存，不会重复创建。
 type Proxy struct {
-	rdb             *redis.Client
-	prefix          string
-	prefixSeparator string
+	rdb                    *redis.Client
+	prefix                 string
+	prefixSeparator        string
+	channelPrefix          string
+	channelPrefixSeparator string
 }
 
 // key 为原始 key 拼接前缀。
@@ -40,11 +43,54 @@ func (p *Proxy) keys(ks []string) []string {
 	return result
 }
 
+// channel 为原始 Pub/Sub channel 拼接 channel 前缀。
+func (p *Proxy) channel(ch string) string {
+	return prefixKey(p.channelPrefix, p.channelPrefixSeparator, ch)
+}
+
+// channels 为多个 Pub/Sub channel 或 pattern 批量拼接 channel 前缀。
+func (p *Proxy) channels(chs []string) []string {
+	if len(chs) == 0 {
+		return chs
+	}
+	result := make([]string, len(chs))
+	for i, ch := range chs {
+		result[i] = p.channel(ch)
+	}
+	return result
+}
+
+// WrapClient 基于已有 [*redis.Client] 构造 [Proxy]。
+//
+// 返回的 Proxy 不接管 rdb 生命周期，调用方仍负责关闭传入的 client。
+// prefix 与 separator 只用于 key 前缀；Pub/Sub channel 默认不加前缀。
+func WrapClient(rdb *redis.Client, prefix, separator string) (*Proxy, error) {
+	if rdb == nil {
+		return nil, errors.New("redisx: wrap client requires non-nil redis client")
+	}
+	if strings.ContainsAny(prefix, globChars) {
+		return nil, fmt.Errorf("redisx: key prefix %q must not contain glob characters (%s)", prefix, globChars)
+	}
+	if strings.ContainsAny(separator, globChars) {
+		return nil, fmt.Errorf("redisx: key prefix separator %q must not contain glob characters (%s)", separator, globChars)
+	}
+	return &Proxy{rdb: rdb, prefix: prefix, prefixSeparator: separator, channelPrefixSeparator: defaultChannelPrefixSeparator}, nil
+}
+
 // RawClient 返回底层 [*redis.Client]。
 //
 // 注意：通过 RawClient 执行的命令不会自动添加 key 前缀。
 func (p *Proxy) RawClient() *redis.Client {
 	return p.rdb
+}
+
+// WithPrefix 返回复用同一底层 Redis client、但使用指定 key 前缀的新 Proxy。
+//
+// 派生 Proxy 只替换 key 前缀，保留 key 分隔符、channel 前缀和 channel 分隔符。
+func (p *Proxy) WithPrefix(prefix string) *Proxy {
+	cp := *p
+	cp.prefix = prefix
+	return &cp
 }
 
 // Key 返回拼接了前缀的完整 key。
@@ -443,25 +489,25 @@ func (p *Proxy) ZIncrBy(ctx context.Context, key string, increment float64, memb
 //  Pub/Sub commands
 // ──────────────────────────────────────────
 
-// Publish 向指定 channel 发布消息。channel 自动拼接前缀。
+// Publish 向指定 channel 发布消息。channel 使用独立 channel 前缀，不复用 key 前缀。
 func (p *Proxy) Publish(ctx context.Context, channel string, message any) *redis.IntCmd {
-	return p.rdb.Publish(ctx, p.key(channel), message)
+	return p.rdb.Publish(ctx, p.channel(channel), message)
 }
 
-// Subscribe 订阅一个或多个 channel。所有 channel 自动拼接前缀。
+// Subscribe 订阅一个或多个 channel。所有 channel 使用独立 channel 前缀。
 //
 // 返回 [*redis.PubSub]，调用方负责关闭；如需自动管理订阅生命周期，
 // 请使用 [Proxy.Consume]。
 func (p *Proxy) Subscribe(ctx context.Context, channels ...string) *redis.PubSub {
-	return p.rdb.Subscribe(ctx, p.keys(channels)...)
+	return p.rdb.Subscribe(ctx, p.channels(channels)...)
 }
 
 // PSubscribe 按模式订阅一个或多个 channel 模式（如 "events:*"）。
-// 所有模式自动拼接前缀。
+// 所有模式使用独立 channel 前缀。
 //
 // 返回 [*redis.PubSub]，调用方负责关闭。
 func (p *Proxy) PSubscribe(ctx context.Context, patterns ...string) *redis.PubSub {
-	return p.rdb.PSubscribe(ctx, p.keys(patterns)...)
+	return p.rdb.PSubscribe(ctx, p.channels(patterns)...)
 }
 
 // Consume 以受管方式订阅频道并串行消费消息，阻塞直到 ctx 取消或出错。
@@ -472,7 +518,7 @@ func (p *Proxy) PSubscribe(ctx context.Context, patterns ...string) *redis.PubSu
 //
 // handler 串行执行以保证单频道消息顺序，耗时处理请在业务侧自行分发。
 // 注意 Redis Pub/Sub 为 at-most-once，断线期间的消息会丢失；
-// 需要可靠投递请使用 Stream。所有 channel 自动拼接前缀。
+// 需要可靠投递请使用 Stream。所有 channel 使用独立 channel 前缀。
 func (p *Proxy) Consume(ctx context.Context, handler func(*redis.Message), channels ...string) error {
 	if handler == nil {
 		return errors.New("redisx: consume handler is nil")
@@ -480,12 +526,11 @@ func (p *Proxy) Consume(ctx context.Context, handler func(*redis.Message), chann
 	if len(channels) == 0 {
 		return errors.New("redisx: consume requires at least one channel")
 	}
-	return consumeSub(ctx, p.rdb.Subscribe(ctx, p.keys(channels)...), handler, channels)
+	return consumeSub(ctx, p.rdb.Subscribe(ctx, p.channels(channels)...), handler, channels)
 }
 
 // ConsumePattern 以受管方式按模式订阅（PSUBSCRIBE）并串行消费消息，
-// 生命周期语义与 [Proxy.Consume] 完全一致。所有模式自动拼接前缀
-// （如 "events:*" 实际订阅 "{prefix}:events:*"）。
+// 生命周期语义与 [Proxy.Consume] 完全一致。所有模式使用独立 channel 前缀。
 func (p *Proxy) ConsumePattern(ctx context.Context, handler func(*redis.Message), patterns ...string) error {
 	if handler == nil {
 		return errors.New("redisx: consume handler is nil")
@@ -493,7 +538,7 @@ func (p *Proxy) ConsumePattern(ctx context.Context, handler func(*redis.Message)
 	if len(patterns) == 0 {
 		return errors.New("redisx: consume requires at least one pattern")
 	}
-	return consumeSub(ctx, p.rdb.PSubscribe(ctx, p.keys(patterns)...), handler, patterns)
+	return consumeSub(ctx, p.rdb.PSubscribe(ctx, p.channels(patterns)...), handler, patterns)
 }
 
 // consumeSub 是 Consume / ConsumePattern 共用的受管消费循环：

@@ -102,7 +102,7 @@ func newTestClient(tb testing.TB, opts ...Option) *Client {
 func TestIntegrationClientLifecycle(t *testing.T) {
 	t.Parallel()
 
-	c := newTestClient(t, WithInitDBs(1), WithDBConfig(2, testPrefix(t)+"_db2"))
+	c := newTestClient(t, WithInitDBs(1), WithInitDBPrefix(2, testPrefix(t)+"_db2"))
 	ctx := t.Context()
 
 	if err := c.HealthCheck(ctx); err != nil {
@@ -711,7 +711,7 @@ func TestIntegrationByteAndCodecHelpers(t *testing.T) {
 
 // publishUntilReceived 周期发布直到消费方收到（Pub/Sub 是 at-most-once，
 // 订阅生效前发布的消息会丢，轮询发布消除时序依赖）。
-func publishUntilReceived(t *testing.T, c *Client, channel string, received <-chan string) string {
+func publishUntilReceived(t *testing.T, p *Proxy, channel string, received <-chan string) string {
 	t.Helper()
 	deadline := time.After(5 * time.Second)
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -724,7 +724,7 @@ func publishUntilReceived(t *testing.T, c *Client, channel string, received <-ch
 			t.Fatal("等待 Pub/Sub 消息超时")
 			return ""
 		case <-tick.C:
-			if err := c.Publish(t.Context(), channel, "hello").Err(); err != nil {
+			if err := p.Publish(t.Context(), channel, "hello").Err(); err != nil {
 				t.Fatalf("Publish: %v", err)
 			}
 		}
@@ -744,7 +744,7 @@ func TestIntegrationConsume(t *testing.T) {
 		done <- c.Consume(ctx, func(m *redis.Message) { received <- m.Payload }, "events")
 	}()
 
-	if got := publishUntilReceived(t, c, "events", received); got != "hello" {
+	if got := publishUntilReceived(t, c.Proxy, "events", received); got != "hello" {
 		t.Errorf("收到 %q, want hello", got)
 	}
 
@@ -767,7 +767,7 @@ func TestIntegrationConsumePattern(t *testing.T) {
 		done <- c.ConsumePattern(ctx, func(m *redis.Message) { received <- m.Payload }, "ev:*")
 	}()
 
-	if got := publishUntilReceived(t, c, "ev:user", received); got != "hello" {
+	if got := publishUntilReceived(t, c.Proxy, "ev:user", received); got != "hello" {
 		t.Errorf("收到 %q, want hello", got)
 	}
 
@@ -785,14 +785,61 @@ func TestIntegrationSubscribeRaw(t *testing.T) {
 
 	sub := c.Subscribe(ctx, "raw")
 	t.Cleanup(func() { _ = sub.Close() })
-	if _, err := sub.Receive(ctx); err != nil {
+	if _, err := sub.ReceiveTimeout(ctx, 2*time.Second); err != nil {
 		t.Fatalf("Subscribe 确认失败: %v", err)
 	}
 
 	psub := c.PSubscribe(ctx, "raw:*")
 	t.Cleanup(func() { _ = psub.Close() })
-	if _, err := psub.Receive(ctx); err != nil {
+	if _, err := psub.ReceiveTimeout(ctx, 2*time.Second); err != nil {
 		t.Fatalf("PSubscribe 确认失败: %v", err)
+	}
+}
+
+func TestIntegrationPubSubChannelPrefix(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, WithKeyPrefix(testPrefix(t)+"_keys"))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	received := make(chan string, 16)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Consume(ctx, func(m *redis.Message) { received <- m.Channel }, "events")
+	}()
+
+	if got := publishUntilReceived(t, c.Proxy, "events", received); got != "events" {
+		t.Errorf("未配置 channel prefix 时 Channel = %q, want events", got)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Consume 退出错误 = %v, want context.Canceled", err)
+	}
+}
+
+func TestIntegrationPubSubExplicitChannelPrefix(t *testing.T) {
+	t.Parallel()
+
+	prefix := testPrefix(t) + "_topics"
+	c := newTestClient(t, WithKeyPrefix(testPrefix(t)+"_keys"), WithChannelPrefix(prefix))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	received := make(chan string, 16)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.ConsumePattern(ctx, func(m *redis.Message) { received <- m.Pattern + "|" + m.Channel }, "ev:*")
+	}()
+
+	if got := publishUntilReceived(t, c.Proxy, "ev:user", received); got != prefix+":ev:*|"+prefix+":ev:user" {
+		t.Errorf("显式 channel prefix 收到 %q", got)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("ConsumePattern 退出错误 = %v, want context.Canceled", err)
 	}
 }
 

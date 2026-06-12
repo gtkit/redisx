@@ -37,7 +37,7 @@ c, err := redisx.NewClient(
     redisx.WithPassword(os.Getenv("REDIS_PASSWORD")), // 真实值从环境变量读取
     redisx.WithKeyPrefix("myapp"),                    // 全局前缀
     redisx.WithInitDBs(0, 1),                         // 初始化多个 DB
-    redisx.WithDBConfig(2, "session"),                // DB2 使用独立前缀
+    redisx.WithInitDBPrefix(2, "session"),            // DB2 使用独立前缀
 )
 if err != nil {
     log.Fatal(err)
@@ -67,9 +67,12 @@ token, err := c.MustSelectDB(2).Get(ctx, "token:abc").Result()
 | `WithPassword(p)`          | 认证密码                                                       | 空（不认证）       |
 | `WithDB(db)`               | 默认 DB 编号                                                   | 0                  |
 | `WithInitDBs(dbs...)`      | 初始化多个 DB（共享全局前缀）                                  | 仅默认 DB          |
-| `WithDBConfig(db, prefix)` | 初始化单个 DB 并指定独立前缀                                   | —                 |
+| `WithInitDBPrefix(db, prefix)` | 初始化单个 DB 并指定独立前缀                              | —                 |
+| `WithDBConfig(db, prefix)` | 已废弃兼容别名，等价于 `WithInitDBPrefix`                       | —                 |
 | `WithKeyPrefix(prefix)`    | 全局 key 前缀                                                  | 空（不加前缀）     |
 | `WithKeyPrefixSeparator(s)` | key 前缀与原始 key 之间的连接符                                | `:`                |
+| `WithChannelPrefix(prefix)` | Pub/Sub channel 前缀（独立于 key 前缀）                         | 空（不加前缀）     |
+| `WithChannelPrefixSeparator(s)` | channel 前缀与原始 channel 之间的连接符                    | `:`                |
 | `WithPoolSize(n)`          | 每个 DB 的最大连接数                                           | 10                 |
 | `WithMinIdleConns(n)`      | 最小空闲连接数                                                 | 3                  |
 | `WithMaxRetries(n)`        | 命令失败重试次数（非幂等命令慎用，见下文）                     | 3                  |
@@ -130,7 +133,9 @@ c, err := redisx.NewClient(
 
 设置 `WithKeyPrefix("myapp")` 后，所有带 key 参数的命令默认自动拼接为 `myapp:{key}`，业务层无感知。可通过 `WithKeyPrefixSeparator(".")` 改为 `myapp.{key}` 等自定义格式。
 
-**前缀优先级**：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
+**前缀优先级**：`WithInitDBPrefix` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
+
+Pub/Sub channel 是 Redis 实例级全局命名空间，不随 DB 切换；`WithKeyPrefix` 不影响 channel。如需隔离 topic，请使用 `WithChannelPrefix("myapp")`。
 
 **不拼前缀的出口**（需要自己负责完整 key）：
 
@@ -364,8 +369,10 @@ v, err := c.EvalScript(ctx, script, []string{"k"}).Result()
 
 Redis Pub/Sub 为 **at-most-once**：不落盘、不重投，订阅者断线期间的消息永久丢失。适合在线通知、缓存失效广播等"丢了无所谓"的场景；需要可靠投递请用 [Stream](#stream-消费组可靠消息)。
 
+Pub/Sub channel 默认不使用 key 前缀。需要 topic 命名空间隔离时，在初始化时显式设置 `WithChannelPrefix("myapp")`，或配合 `WithChannelPrefixSeparator(".")` 自定义拼接格式。
+
 ```go
-// 发布（channel 自动拼前缀）
+// 发布（默认使用原始 channel；不会套用 WithKeyPrefix）
 c.Publish(ctx, "events:user", "user_created")
 
 // 受管消费（推荐）：订阅确认、连接关闭、ctx 退出、panic 恢复均由库内管理
@@ -387,6 +394,8 @@ defer sub.Close()
 ```
 
 `Consume` / `ConsumePattern` 的 handler **串行执行**以保证单频道顺序，耗时处理请投递到业务自有 worker；handler panic 会被恢复，消费终止并以 error 返回。
+
+如果配置了 `WithChannelPrefix("myapp")`，上面的 `"events:user"` 实际发布 / 订阅到 `"myapp:events:user"`；模式 `"events:*"` 实际订阅到 `"myapp:events:*"`。
 
 ---
 

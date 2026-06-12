@@ -92,7 +92,13 @@ func NewClient(opts ...Option) (*Client, error) {
 		if prefix == "" {
 			prefix = cfg.KeyPrefix // 使用全局前缀
 		}
-		proxies[db] = &Proxy{rdb: rdb, prefix: prefix, prefixSeparator: cfg.KeyPrefixSeparator}
+		proxies[db] = &Proxy{
+			rdb:                    rdb,
+			prefix:                 prefix,
+			prefixSeparator:        cfg.KeyPrefixSeparator,
+			channelPrefix:          cfg.ChannelPrefix,
+			channelPrefixSeparator: cfg.ChannelPrefixSeparator,
+		}
 	}
 
 	c := &Client{
@@ -211,7 +217,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 
 // SelectDB 返回指定 DB 编号上的命令代理 [Proxy]，支持链式调用。
 //
-// 如果指定的 DB 未在 [WithInitDBs] / [WithDBConfig] 中初始化，返回错误。
+// 如果指定的 DB 未在 [WithInitDBs] / [WithInitDBPrefix] 中初始化，返回错误。
 func (c *Client) SelectDB(db int) (*Proxy, error) {
 	if p, ok := c.proxies[db]; ok {
 		return p, nil

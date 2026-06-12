@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 `WithInitDBPrefix(db, prefix)` 作为 per-DB 独立前缀的首选 Option；`WithDBConfig` 保留为兼容别名并标记废弃
+- 新增 `WithChannelPrefix(prefix)` / `WithChannelPrefixSeparator(s)`，Pub/Sub channel 前缀与 key 前缀解耦
+- 新增 `Proxy.WithPrefix(prefix)`，可在同一底层 Redis client 上派生不同 key 命名空间的 Proxy
+- 新增 `WrapClient(rdb, prefix, separator)`，便于将已有 `*redis.Client` 包装为 Proxy 用于测试 / DI
+
+### Changed
+
+- **行为变化（边缘 BREAKING）**：Pub/Sub `Publish` / `Subscribe` / `PSubscribe` / `Consume` / `ConsumePattern` 默认不再复用 key 前缀；需要保持旧 channel 名称隔离的调用方请显式配置 `WithChannelPrefix`
+
 ## [1.2.0] - 2026-06-12
 
 ### Added

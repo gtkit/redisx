@@ -38,6 +38,12 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.KeyPrefixSeparator != defaultKeyPrefixSeparator {
 		t.Errorf("KeyPrefixSeparator = %q, want %q", cfg.KeyPrefixSeparator, defaultKeyPrefixSeparator)
 	}
+	if cfg.ChannelPrefix != "" {
+		t.Errorf("ChannelPrefix = %q, want empty", cfg.ChannelPrefix)
+	}
+	if cfg.ChannelPrefixSeparator != defaultChannelPrefixSeparator {
+		t.Errorf("ChannelPrefixSeparator = %q, want %q", cfg.ChannelPrefixSeparator, defaultChannelPrefixSeparator)
+	}
 	if cfg.AllowPartialInit {
 		t.Error("AllowPartialInit 默认应为 false（全有或全无）")
 	}
@@ -67,6 +73,8 @@ func TestConfigValidate(t *testing.T) {
 		{name: "全局前缀含星号", mutate: func(c *Config) { c.KeyPrefix = "app*" }, wantErr: "must not contain glob characters"},
 		{name: "全局前缀含反斜杠", mutate: func(c *Config) { c.KeyPrefix = `a\b` }, wantErr: "must not contain glob characters"},
 		{name: "前缀连接符含星号", mutate: func(c *Config) { c.KeyPrefixSeparator = "*" }, wantErr: "key prefix separator"},
+		{name: "channel前缀含方括号", mutate: func(c *Config) { c.ChannelPrefix = "tenant[1]" }, wantErr: "channel prefix"},
+		{name: "channel前缀连接符含星号", mutate: func(c *Config) { c.ChannelPrefixSeparator = "*" }, wantErr: "channel prefix separator"},
 		{
 			name:    "perDB前缀含方括号",
 			mutate:  func(c *Config) { c.InitDBs = []DBConfig{{DB: 1, Prefix: "tenant[3]"}} },
@@ -124,7 +132,7 @@ func TestOptionsApply(t *testing.T) {
 		WithPassword("secret"),
 		WithDB(2),
 		WithInitDBs(1, 3),
-		WithDBConfig(4, "session"),
+		WithInitDBPrefix(4, "session"),
 		WithPoolSize(20),
 		WithMinIdleConns(5),
 		WithMaxRetries(0),
@@ -134,6 +142,8 @@ func TestOptionsApply(t *testing.T) {
 		WithIdleTimeout(time.Minute),
 		WithKeyPrefix("app"),
 		WithKeyPrefixSeparator("."),
+		WithChannelPrefix("topic"),
+		WithChannelPrefixSeparator("/"),
 		WithTLSConfig(tlsCfg),
 		WithAllowPartialInit(),
 	}
@@ -189,10 +199,37 @@ func TestOptionsApply(t *testing.T) {
 	if cfg.KeyPrefixSeparator != "." {
 		t.Errorf("KeyPrefixSeparator = %q", cfg.KeyPrefixSeparator)
 	}
+	if cfg.ChannelPrefix != "topic" {
+		t.Errorf("ChannelPrefix = %q", cfg.ChannelPrefix)
+	}
+	if cfg.ChannelPrefixSeparator != "/" {
+		t.Errorf("ChannelPrefixSeparator = %q", cfg.ChannelPrefixSeparator)
+	}
 	if cfg.TLSConfig != tlsCfg {
 		t.Errorf("TLSConfig = %v, want %v", cfg.TLSConfig, tlsCfg)
 	}
 	if !cfg.AllowPartialInit {
 		t.Error("AllowPartialInit = false, want true")
+	}
+}
+
+func TestWithDBConfigAlias(t *testing.T) {
+	t.Parallel()
+
+	preferred := defaultConfig()
+	WithInitDBPrefix(2, "session")(preferred)
+	WithInitDBPrefix(3, "")(preferred)
+
+	compat := defaultConfig()
+	WithDBConfig(2, "session")(compat)
+	WithDBConfig(3, "")(compat)
+
+	if len(preferred.InitDBs) != len(compat.InitDBs) {
+		t.Fatalf("InitDBs len = %d, want %d", len(compat.InitDBs), len(preferred.InitDBs))
+	}
+	for i := range preferred.InitDBs {
+		if compat.InitDBs[i] != preferred.InitDBs[i] {
+			t.Fatalf("InitDBs[%d] = %v, want %v", i, compat.InitDBs[i], preferred.InitDBs[i])
+		}
 	}
 }

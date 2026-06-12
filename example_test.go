@@ -30,10 +30,11 @@ func Example() {
 		redisx.WithAddr("127.0.0.1:6379"),
 		redisx.WithUsername("default"), // Redis 6+ ACL
 		redisx.WithPassword("123456"),
-		redisx.WithDB(0),                  // 默认 DB
-		redisx.WithKeyPrefix("app:demo"),  // 全局前缀
-		redisx.WithInitDBs(0, 1, 2),       // 初始化多个 DB（共享全局前缀）
-		redisx.WithDBConfig(3, "session"), // DB3 使用独立前缀 "session"
+		redisx.WithDB(0),                      // 默认 DB
+		redisx.WithKeyPrefix("app:demo"),      // 全局前缀
+		redisx.WithChannelPrefix("app:topic"), // Pub/Sub channel 前缀（独立于 key 前缀）
+		redisx.WithInitDBs(0, 1, 2),           // 初始化多个 DB（共享全局前缀）
+		redisx.WithInitDBPrefix(3, "session"), // DB3 使用独立前缀 "session"
 		redisx.WithPoolSize(20),
 		redisx.WithMinIdleConns(5),
 		redisx.WithMaxRetries(3),
@@ -123,7 +124,7 @@ func Example() {
 	pipe.Del(ctx, proxy.Keys("batch:1", "batch:2")...) // 多 key 批量拼前缀
 	_, _ = pipe.Exec(ctx)
 
-	// ─── 13. Pub/Sub ───
+	// ─── 13. Pub/Sub（channel 使用独立前缀，不复用 key 前缀）───
 	pubsub := c2.Subscribe(ctx, "events:user")
 	defer pubsub.Close()
 
@@ -147,9 +148,9 @@ func Example() {
 func Example_migration() {
 	c, err := redisx.NewClient(
 		redisx.WithAddr("127.0.0.1:6379"),
-		redisx.WithDBConfig(0, "test"),
+		redisx.WithInitDBPrefix(0, "test"),
 		redisx.WithInitDBs(1),
-		redisx.WithDBConfig(2, "prefix:test2"),
+		redisx.WithInitDBPrefix(2, "prefix:test2"),
 	)
 	if err != nil {
 		log.Fatal(err)

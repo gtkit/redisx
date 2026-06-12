@@ -13,6 +13,7 @@ import (
 const globChars = `*?[]\`
 
 const defaultKeyPrefixSeparator = ":"
+const defaultChannelPrefixSeparator = ":"
 
 // DBConfig 定义单个 DB 的配置（编号 + 可选独立前缀）。
 //
@@ -73,6 +74,14 @@ type Config struct {
 	// 默认 ":"；仅当前缀非空时参与拼接。
 	KeyPrefixSeparator string
 
+	// ChannelPrefix 是 Pub/Sub channel 前缀。
+	// Redis Pub/Sub channel 是实例级全局命名空间，不随 DB 切换；默认不使用 key 前缀。
+	ChannelPrefix string
+
+	// ChannelPrefixSeparator 是 channel 前缀与原始 channel 之间的连接符。
+	// 默认 ":"；仅当 ChannelPrefix 非空时参与拼接。
+	ChannelPrefixSeparator string
+
 	// TLSConfig 是连接 Redis 的 TLS 配置。nil 表示不启用 TLS。
 	TLSConfig *tls.Config
 
@@ -84,15 +93,16 @@ type Config struct {
 // defaultConfig 返回包含生产合理默认值的 Config。
 func defaultConfig() *Config {
 	return &Config{
-		DefaultDB:          0,
-		PoolSize:           10,
-		MinIdleConns:       3,
-		MaxRetries:         3,
-		DialTimeout:        5 * time.Second,
-		ReadTimeout:        3 * time.Second,
-		WriteTimeout:       3 * time.Second,
-		IdleTimeout:        5 * time.Minute,
-		KeyPrefixSeparator: defaultKeyPrefixSeparator,
+		DefaultDB:              0,
+		PoolSize:               10,
+		MinIdleConns:           3,
+		MaxRetries:             3,
+		DialTimeout:            5 * time.Second,
+		ReadTimeout:            3 * time.Second,
+		WriteTimeout:           3 * time.Second,
+		IdleTimeout:            5 * time.Minute,
+		KeyPrefixSeparator:     defaultKeyPrefixSeparator,
+		ChannelPrefixSeparator: defaultChannelPrefixSeparator,
 	}
 }
 
@@ -133,6 +143,12 @@ func (c *Config) validate() error {
 	if strings.ContainsAny(c.KeyPrefixSeparator, globChars) {
 		return fmt.Errorf("redisx: key prefix separator %q must not contain glob characters (%s)", c.KeyPrefixSeparator, globChars)
 	}
+	if strings.ContainsAny(c.ChannelPrefix, globChars) {
+		return fmt.Errorf("redisx: channel prefix %q must not contain glob characters (%s)", c.ChannelPrefix, globChars)
+	}
+	if strings.ContainsAny(c.ChannelPrefixSeparator, globChars) {
+		return fmt.Errorf("redisx: channel prefix separator %q must not contain glob characters (%s)", c.ChannelPrefixSeparator, globChars)
+	}
 	for _, dc := range c.InitDBs {
 		if strings.ContainsAny(dc.Prefix, globChars) {
 			return fmt.Errorf("redisx: db=%d prefix %q must not contain glob characters (%s)", dc.DB, dc.Prefix, globChars)
@@ -172,7 +188,7 @@ func WithDB(db int) Option {
 // WithInitDBs 设置需要初始化的多个 DB 编号。
 //
 // DefaultDB 会自动包含在列表中，无需重复添加。
-// 所有 DB 共享全局 KeyPrefix。如需 per-DB 前缀，请使用 [WithDBConfig]。
+// 所有 DB 共享全局 KeyPrefix。如需 per-DB 前缀，请使用 [WithInitDBPrefix]。
 //
 // 示例: WithInitDBs(0, 1, 2) 将同时初始化 DB0、DB1、DB2。
 func WithInitDBs(dbs ...int) Option {
@@ -183,17 +199,24 @@ func WithInitDBs(dbs ...int) Option {
 	}
 }
 
-// WithDBConfig 添加一个带独立前缀的 DB 配置。
+// WithInitDBPrefix 初始化指定 DB，并为该 DB 设置独立 key 前缀。
 //
 // 当 prefix 非空时，该 DB 使用独立前缀替代全局 KeyPrefix。
 // 兼容 v1 的 WithDB(db, "prefix") 语义。
 //
-// 示例: WithDBConfig(2, "session") 使 DB2 的 key 前缀为 "session:" 而非全局前缀。
+// 示例: WithInitDBPrefix(2, "session") 使 DB2 的 key 前缀为 "session:" 而非全局前缀。
 // 前缀连接符可通过 [WithKeyPrefixSeparator] 全局配置。
-func WithDBConfig(db int, prefix string) Option {
+func WithInitDBPrefix(db int, prefix string) Option {
 	return func(c *Config) {
 		c.InitDBs = append(c.InitDBs, DBConfig{DB: db, Prefix: prefix})
 	}
+}
+
+// WithDBConfig 添加一个带独立前缀的 DB 配置。
+//
+// Deprecated: use [WithInitDBPrefix].
+func WithDBConfig(db int, prefix string) Option {
+	return WithInitDBPrefix(db, prefix)
 }
 
 // WithPoolSize 设置每个 DB 连接池的最大连接数。
@@ -241,7 +264,7 @@ func WithIdleTimeout(d time.Duration) Option {
 // WithKeyPrefix 设置全局 key 前缀。
 //
 // 设置后所有带 key 参数的命令会自动拼接为 "{prefix}{separator}{key}"，
-// 对业务层完全透明。可被 per-DB 前缀覆盖（见 [WithDBConfig]）。
+// 对业务层完全透明。可被 per-DB 前缀覆盖（见 [WithInitDBPrefix]）。
 func WithKeyPrefix(prefix string) Option {
 	return func(c *Config) { c.KeyPrefix = prefix }
 }
@@ -251,6 +274,21 @@ func WithKeyPrefix(prefix string) Option {
 // 默认 ":"。仅当前缀非空时参与拼接；传入空字符串表示直接连接前缀和 key。
 func WithKeyPrefixSeparator(separator string) Option {
 	return func(c *Config) { c.KeyPrefixSeparator = separator }
+}
+
+// WithChannelPrefix 设置 Pub/Sub channel 前缀。
+//
+// Redis Pub/Sub channel 是实例级全局命名空间，不随 DB 切换；默认不复用 key 前缀。
+// 设置后 Pub/Sub 方法会将 channel 拼接为 "{prefix}{separator}{channel}"。
+func WithChannelPrefix(prefix string) Option {
+	return func(c *Config) { c.ChannelPrefix = prefix }
+}
+
+// WithChannelPrefixSeparator 设置 Pub/Sub channel 前缀与原始 channel 之间的连接符。
+//
+// 默认 ":"。仅当 channel 前缀非空时参与拼接；传入空字符串表示直接连接前缀和 channel。
+func WithChannelPrefixSeparator(separator string) Option {
+	return func(c *Config) { c.ChannelPrefixSeparator = separator }
 }
 
 // WithTLSConfig 设置连接 Redis 的 TLS 配置。
