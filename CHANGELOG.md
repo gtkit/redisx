@@ -8,8 +8,8 @@
 
 - 新增 `WithInitDBPrefix(db, prefix)` 作为 per-DB 独立前缀的首选 Option；`WithDBConfig` 保留为兼容别名并标记废弃
 - 新增 `WithChannelPrefix(prefix)` / `WithChannelPrefixSeparator(s)`，Pub/Sub channel 前缀与 key 前缀解耦
-- 新增 `Proxy.WithPrefix(prefix)`，可在同一底层 Redis client 上派生不同 key 命名空间的 Proxy
-- 新增 `WrapClient(rdb, prefix, separator)`，便于将已有 `*redis.Client` 包装为 Proxy 用于测试 / DI
+- 新增 `Proxy.WithPrefix(prefix)`，可在同一底层 Redis client 上派生不同 key 命名空间的 Proxy，并复用前缀安全校验
+- 新增 `WrapClient(rdb, opts...)` 与 `WithProxyPrefix` / `WithProxyChannelPrefix` 等 ProxyOption，便于将已有 `*redis.Client` 包装为 Proxy 用于测试 / DI
 
 ### Changed
 

@@ -60,21 +60,80 @@ func (p *Proxy) channels(chs []string) []string {
 	return result
 }
 
+// ProxyOption 配置由 [WrapClient] 构造的 [Proxy]。
+type ProxyOption func(*proxyConfig)
+
+type proxyConfig struct {
+	prefix                 string
+	prefixSeparator        string
+	channelPrefix          string
+	channelPrefixSeparator string
+}
+
+func defaultProxyConfig() *proxyConfig {
+	return &proxyConfig{
+		prefixSeparator:        defaultKeyPrefixSeparator,
+		channelPrefixSeparator: defaultChannelPrefixSeparator,
+	}
+}
+
+func (c *proxyConfig) validate() error {
+	if err := validatePrefix("key prefix", c.prefix); err != nil {
+		return err
+	}
+	if err := validatePrefix("key prefix separator", c.prefixSeparator); err != nil {
+		return err
+	}
+	if err := validatePrefix("channel prefix", c.channelPrefix); err != nil {
+		return err
+	}
+	if err := validatePrefix("channel prefix separator", c.channelPrefixSeparator); err != nil {
+		return err
+	}
+	return nil
+}
+
+// WithProxyPrefix 设置 [WrapClient] 返回 Proxy 的 key 前缀。
+func WithProxyPrefix(prefix string) ProxyOption {
+	return func(c *proxyConfig) { c.prefix = prefix }
+}
+
+// WithProxyPrefixSeparator 设置 [WrapClient] 返回 Proxy 的 key 前缀连接符。
+func WithProxyPrefixSeparator(separator string) ProxyOption {
+	return func(c *proxyConfig) { c.prefixSeparator = separator }
+}
+
+// WithProxyChannelPrefix 设置 [WrapClient] 返回 Proxy 的 Pub/Sub channel 前缀。
+func WithProxyChannelPrefix(prefix string) ProxyOption {
+	return func(c *proxyConfig) { c.channelPrefix = prefix }
+}
+
+// WithProxyChannelPrefixSeparator 设置 [WrapClient] 返回 Proxy 的 Pub/Sub channel 前缀连接符。
+func WithProxyChannelPrefixSeparator(separator string) ProxyOption {
+	return func(c *proxyConfig) { c.channelPrefixSeparator = separator }
+}
+
 // WrapClient 基于已有 [*redis.Client] 构造 [Proxy]。
 //
 // 返回的 Proxy 不接管 rdb 生命周期，调用方仍负责关闭传入的 client。
-// prefix 与 separator 只用于 key 前缀；Pub/Sub channel 默认不加前缀。
-func WrapClient(rdb *redis.Client, prefix, separator string) (*Proxy, error) {
+func WrapClient(rdb *redis.Client, opts ...ProxyOption) (*Proxy, error) {
 	if rdb == nil {
 		return nil, errors.New("redisx: wrap client requires non-nil redis client")
 	}
-	if strings.ContainsAny(prefix, globChars) {
-		return nil, fmt.Errorf("redisx: key prefix %q must not contain glob characters (%s)", prefix, globChars)
+	cfg := defaultProxyConfig()
+	for _, opt := range opts {
+		opt(cfg)
 	}
-	if strings.ContainsAny(separator, globChars) {
-		return nil, fmt.Errorf("redisx: key prefix separator %q must not contain glob characters (%s)", separator, globChars)
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
-	return &Proxy{rdb: rdb, prefix: prefix, prefixSeparator: separator, channelPrefixSeparator: defaultChannelPrefixSeparator}, nil
+	return &Proxy{
+		rdb:                    rdb,
+		prefix:                 cfg.prefix,
+		prefixSeparator:        cfg.prefixSeparator,
+		channelPrefix:          cfg.channelPrefix,
+		channelPrefixSeparator: cfg.channelPrefixSeparator,
+	}, nil
 }
 
 // RawClient 返回底层 [*redis.Client]。
@@ -87,10 +146,13 @@ func (p *Proxy) RawClient() *redis.Client {
 // WithPrefix 返回复用同一底层 Redis client、但使用指定 key 前缀的新 Proxy。
 //
 // 派生 Proxy 只替换 key 前缀，保留 key 分隔符、channel 前缀和 channel 分隔符。
-func (p *Proxy) WithPrefix(prefix string) *Proxy {
+func (p *Proxy) WithPrefix(prefix string) (*Proxy, error) {
+	if err := validatePrefix("key prefix", prefix); err != nil {
+		return nil, err
+	}
 	cp := *p
 	cp.prefix = prefix
-	return &cp
+	return &cp, nil
 }
 
 // Key 返回拼接了前缀的完整 key。

@@ -99,7 +99,10 @@ func TestProxyWithPrefix(t *testing.T) {
 		channelPrefix:          "topic",
 		channelPrefixSeparator: "/",
 	}
-	derived := base.WithPrefix("cache")
+	derived, err := base.WithPrefix("cache")
+	if err != nil {
+		t.Fatalf("WithPrefix() = %v", err)
+	}
 
 	if derived == base {
 		t.Fatal("WithPrefix() returned receiver")
@@ -116,6 +119,10 @@ func TestProxyWithPrefix(t *testing.T) {
 	if got := derived.channel("events"); got != "topic/events" {
 		t.Errorf("derived channel() = %q, want topic/events", got)
 	}
+
+	if _, err := base.WithPrefix("tenant[1]"); err == nil || !strings.Contains(err.Error(), "key prefix") {
+		t.Fatalf("WithPrefix() invalid prefix = %v, want key prefix error", err)
+	}
 }
 
 func TestWrapClient(t *testing.T) {
@@ -124,7 +131,13 @@ func TestWrapClient(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	p, err := WrapClient(rdb, "test", ":")
+	p, err := WrapClient(
+		rdb,
+		WithProxyPrefix("test"),
+		WithProxyPrefixSeparator(":"),
+		WithProxyChannelPrefix("topic"),
+		WithProxyChannelPrefixSeparator("."),
+	)
 	if err != nil {
 		t.Fatalf("WrapClient() = %v", err)
 	}
@@ -134,25 +147,26 @@ func TestWrapClient(t *testing.T) {
 	if got := p.Key("k"); got != "test:k" {
 		t.Errorf("Key() = %q, want test:k", got)
 	}
-	if got := p.channel("events"); got != "events" {
-		t.Errorf("channel() = %q, want events", got)
+	if got := p.channel("events"); got != "topic.events" {
+		t.Errorf("channel() = %q, want topic.events", got)
 	}
 
 	tests := []struct {
-		name      string
-		rdb       *redis.Client
-		prefix    string
-		separator string
-		wantErr   string
+		name    string
+		rdb     *redis.Client
+		opts    []ProxyOption
+		wantErr string
 	}{
-		{name: "nil client", rdb: nil, prefix: "test", separator: ":", wantErr: "non-nil redis client"},
-		{name: "invalid prefix", rdb: rdb, prefix: "tenant[1]", separator: ":", wantErr: "key prefix"},
-		{name: "invalid separator", rdb: rdb, prefix: "test", separator: "*", wantErr: "key prefix separator"},
+		{name: "nil client", rdb: nil, opts: []ProxyOption{WithProxyPrefix("test")}, wantErr: "non-nil redis client"},
+		{name: "invalid prefix", rdb: rdb, opts: []ProxyOption{WithProxyPrefix("tenant[1]")}, wantErr: "key prefix"},
+		{name: "invalid separator", rdb: rdb, opts: []ProxyOption{WithProxyPrefixSeparator("*")}, wantErr: "key prefix separator"},
+		{name: "invalid channel prefix", rdb: rdb, opts: []ProxyOption{WithProxyChannelPrefix("topic?")}, wantErr: "channel prefix"},
+		{name: "invalid channel separator", rdb: rdb, opts: []ProxyOption{WithProxyChannelPrefixSeparator("[")}, wantErr: "channel prefix separator"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := WrapClient(tt.rdb, tt.prefix, tt.separator)
+			_, err := WrapClient(tt.rdb, tt.opts...)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("WrapClient() = %v, want error containing %q", err, tt.wantErr)
 			}

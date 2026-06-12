@@ -165,6 +165,29 @@ fulls := p.Keys("k1", "k2")       // ["myapp:k1", "myapp:k2"]
 prefix := c.Prefix()              // "myapp"
 ```
 
+### 同一 DB 多命名空间
+
+同一个 DB 里可以复用同一连接池派生多套 key 命名空间；Pub/Sub channel 仍按独立 channel 前缀处理：
+
+```go
+db2 := c.MustSelectDB(2)
+
+cache, err := db2.WithPrefix("cache")
+if err != nil {
+    return err
+}
+triggers, err := db2.WithPrefix("trigger")
+if err != nil {
+    return err
+}
+
+cache.Set(ctx, "user:42", payload, time.Minute)      // Redis key: cache:user:42
+triggers.Set(ctx, "user:42", "refresh", time.Minute) // Redis key: trigger:user:42
+
+// channel 不随 key prefix 变化；需要 topic 隔离请在 NewClient 时配置 WithChannelPrefix。
+db2.Publish(ctx, "events:user", "changed")
+```
+
 ---
 
 ## 多 DB 使用

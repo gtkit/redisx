@@ -137,22 +137,29 @@ func (c *Config) validate() error {
 			return fmt.Errorf("redisx: %s must be > 0, got %v", tc.name, tc.d)
 		}
 	}
-	if strings.ContainsAny(c.KeyPrefix, globChars) {
-		return fmt.Errorf("redisx: key prefix %q must not contain glob characters (%s)", c.KeyPrefix, globChars)
+	if err := validatePrefix("key prefix", c.KeyPrefix); err != nil {
+		return err
 	}
-	if strings.ContainsAny(c.KeyPrefixSeparator, globChars) {
-		return fmt.Errorf("redisx: key prefix separator %q must not contain glob characters (%s)", c.KeyPrefixSeparator, globChars)
+	if err := validatePrefix("key prefix separator", c.KeyPrefixSeparator); err != nil {
+		return err
 	}
-	if strings.ContainsAny(c.ChannelPrefix, globChars) {
-		return fmt.Errorf("redisx: channel prefix %q must not contain glob characters (%s)", c.ChannelPrefix, globChars)
+	if err := validatePrefix("channel prefix", c.ChannelPrefix); err != nil {
+		return err
 	}
-	if strings.ContainsAny(c.ChannelPrefixSeparator, globChars) {
-		return fmt.Errorf("redisx: channel prefix separator %q must not contain glob characters (%s)", c.ChannelPrefixSeparator, globChars)
+	if err := validatePrefix("channel prefix separator", c.ChannelPrefixSeparator); err != nil {
+		return err
 	}
 	for _, dc := range c.InitDBs {
 		if strings.ContainsAny(dc.Prefix, globChars) {
 			return fmt.Errorf("redisx: db=%d prefix %q must not contain glob characters (%s)", dc.DB, dc.Prefix, globChars)
 		}
+	}
+	return nil
+}
+
+func validatePrefix(name, value string) error {
+	if strings.ContainsAny(value, globChars) {
+		return fmt.Errorf("redisx: %s %q must not contain glob characters (%s)", name, value, globChars)
 	}
 	return nil
 }
