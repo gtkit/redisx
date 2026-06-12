@@ -7,6 +7,7 @@ package redisx
 // 结束时 DelByPattern 清理，互不干扰且不污染共享 Redis。
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,6 +20,39 @@ import (
 
 	"github.com/redis/go-redis/v9"
 )
+
+type testCodec struct {
+	marshalErr   error
+	unmarshalErr error
+}
+
+func (c testCodec) Marshal(v any) ([]byte, error) {
+	if c.marshalErr != nil {
+		return nil, c.marshalErr
+	}
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("unsupported %T", v)
+	}
+	return []byte("codec:" + s), nil
+}
+
+func (c testCodec) Unmarshal(data []byte, v any) error {
+	if c.unmarshalErr != nil {
+		return c.unmarshalErr
+	}
+	out, ok := v.(*string)
+	if !ok {
+		return fmt.Errorf("unsupported target %T", v)
+	}
+	const prefix = "codec:"
+	s := string(data)
+	if !strings.HasPrefix(s, prefix) {
+		return fmt.Errorf("missing codec prefix")
+	}
+	*out = strings.TrimPrefix(s, prefix)
+	return nil
+}
 
 func testRedisAddr(tb testing.TB) string {
 	tb.Helper()
@@ -603,6 +637,71 @@ func TestIntegrationJSONHelpers(t *testing.T) {
 	if err := SetJSON(ctx, c.Proxy, "u:chan", make(chan int), 0); err == nil ||
 		!strings.Contains(err.Error(), c.Key("u:chan")) {
 		t.Errorf("序列化失败 = %v, 期望含完整 key", err)
+	}
+
+	if _, err := GetJSON[user](ctx, nil, "u:nil"); err == nil || !strings.Contains(err.Error(), "proxy is nil") {
+		t.Errorf("GetJSON nil proxy = %v, 期望参数错误", err)
+	}
+	if err := SetJSON(ctx, nil, "u:nil", want, 0); err == nil || !strings.Contains(err.Error(), "proxy is nil") {
+		t.Errorf("SetJSON nil proxy = %v, 期望参数错误", err)
+	}
+}
+
+func TestIntegrationByteAndCodecHelpers(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t)
+	ctx := t.Context()
+
+	payload := []byte{0, 1, 2, 3, 255}
+	if err := SetBytes(ctx, c.Proxy, "bin:1", payload, time.Minute); err != nil {
+		t.Fatalf("SetBytes: %v", err)
+	}
+	gotBytes, err := GetBytes(ctx, c.Proxy, "bin:1")
+	if err != nil || !bytes.Equal(gotBytes, payload) {
+		t.Errorf("GetBytes = (%v, %v), want (%v, nil)", gotBytes, err, payload)
+	}
+
+	if _, missingErr := GetBytes(ctx, c.Proxy, "bin:missing"); !errors.Is(missingErr, redis.Nil) {
+		t.Errorf("GetBytes missing = %v, want redis.Nil", missingErr)
+	}
+
+	codec := testCodec{}
+	if setErr := SetCodec(ctx, c.Proxy, "codec:1", codec, "alice", time.Minute); setErr != nil {
+		t.Fatalf("SetCodec: %v", setErr)
+	}
+	decoded, err := GetCodec[string](ctx, c.Proxy, "codec:1", codec)
+	if err != nil || decoded != "alice" {
+		t.Errorf("GetCodec = (%q, %v), want (alice, nil)", decoded, err)
+	}
+
+	marshalErr := errors.New("marshal failed")
+	if err := SetCodec(ctx, c.Proxy, "codec:bad", testCodec{marshalErr: marshalErr}, "alice", 0); !errors.Is(err, marshalErr) ||
+		!strings.Contains(err.Error(), c.Key("codec:bad")) {
+		t.Errorf("SetCodec marshal error = %v, want wrapped key error", err)
+	}
+
+	if err := c.Set(ctx, "codec:bad-data", "plain", 0).Err(); err != nil {
+		t.Fatalf("Set bad codec data: %v", err)
+	}
+	if _, err := GetCodec[string](ctx, c.Proxy, "codec:bad-data", codec); err == nil ||
+		!strings.Contains(err.Error(), c.Key("codec:bad-data")) {
+		t.Errorf("GetCodec unmarshal error = %v, want key error", err)
+	}
+
+	if err := SetBytes(ctx, nil, "k", payload, 0); err == nil || !strings.Contains(err.Error(), "proxy is nil") {
+		t.Errorf("SetBytes nil proxy = %v, 期望参数错误", err)
+	}
+	if _, err := GetBytes(ctx, nil, "k"); err == nil || !strings.Contains(err.Error(), "proxy is nil") {
+		t.Errorf("GetBytes nil proxy = %v, 期望参数错误", err)
+	}
+	if err := SetCodec(ctx, c.Proxy, "codec:nil", nil, "alice", 0); err == nil ||
+		!strings.Contains(err.Error(), c.Key("codec:nil")) {
+		t.Errorf("SetCodec nil codec = %v, 期望含 key 的参数错误", err)
+	}
+	if _, err := GetCodec[string](ctx, c.Proxy, "codec:nil", nil); err == nil ||
+		!strings.Contains(err.Error(), c.Key("codec:nil")) {
+		t.Errorf("GetCodec nil codec = %v, 期望含 key 的参数错误", err)
 	}
 }
 

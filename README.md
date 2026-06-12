@@ -2,7 +2,7 @@
 
 基于 [redis/go-redis v9](https://github.com/redis/go-redis) 的生产级 Redis 客户端封装。
 
-**设计原则**：错误全部通过返回值传递，库内不产生任何日志；不内置熔断、降级、重试编排等策略，只提供扩展点；外部直接依赖仅有 go-redis。
+**设计原则**：错误全部通过返回值传递，库内不产生任何日志；不内置熔断、降级、重试编排等策略，只提供扩展点；核心 Redis 能力基于 go-redis，JSON 助手使用 gtkit/json/v2。
 
 ## 特性
 
@@ -225,6 +225,16 @@ redisx.SetJSON(ctx, c.Proxy, "user:1", User{Name: "alice"}, time.Hour)
 
 u, err := redisx.GetJSON[User](ctx, c.Proxy, "user:1")
 if errors.Is(err, redis.Nil) { /* key 不存在，u 为零值 */ }
+```
+
+非 JSON 编码可显式存取 bytes，或提供业务自己的 Codec（例如 protobuf/gob/msgpack 适配器；redisx 不引入这些依赖）：
+
+```go
+_ = redisx.SetBytes(ctx, c.Proxy, "payload:1", data, time.Hour)
+data, err := redisx.GetBytes(ctx, c.Proxy, "payload:1")
+
+_ = redisx.SetCodec(ctx, c.Proxy, "user:pb:1", protoCodec, user, time.Hour)
+user, err := redisx.GetCodec[User](ctx, c.Proxy, "user:pb:1", protoCodec)
 ```
 
 ### Key 管理

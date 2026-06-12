@@ -2,9 +2,11 @@ package redisx
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
+
+	json "github.com/gtkit/json/v2"
 )
 
 // GetJSON 读取 key 的值并 JSON 反序列化为 T。key 自动拼接前缀。
@@ -17,6 +19,9 @@ import (
 //	if errors.Is(err, redis.Nil) { /* miss */ }
 func GetJSON[T any](ctx context.Context, p *Proxy, key string) (T, error) {
 	var v T
+	if p == nil {
+		return v, errors.New("redisx: json proxy is nil")
+	}
 	data, err := p.Get(ctx, key).Bytes()
 	if err != nil {
 		// redis.Nil 经 %w 透传，调用方仍用 errors.Is 判断 miss
@@ -33,6 +38,9 @@ func GetJSON[T any](ctx context.Context, p *Proxy, key string) (T, error) {
 //
 // 序列化失败返回携带 key 的错误且不发送命令。
 func SetJSON(ctx context.Context, p *Proxy, key string, value any, expiration time.Duration) error {
+	if p == nil {
+		return errors.New("redisx: json proxy is nil")
+	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("redisx: set json key=%q: %w", p.key(key), err)

@@ -4,9 +4,12 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-12
+
 ### Added
 
 - 新增 JSON 泛型助手 `GetJSON[T]` / `SetJSON`：消除结构体值读写的 Marshal/Unmarshal 样板，key 不存在透传 `redis.Nil`
+- 新增 bytes / codec 泛型助手：`SetBytes` / `GetBytes` 显式存取二进制 payload，`Codec` + `SetCodec` / `GetCodec[T]` 支持调用方自带 protobuf/gob/msgpack 等编解码器，不新增这些格式的依赖
 
 - Stream 消费组新增死信策略：`StreamConfig.MaxDeliver` + `DeadLetterStream`，投递超限的毒消息经 Lua 原子（XADD + XACK 无丢失/重复窗口）转入死信流并附 `_redisx_*` 元数据，死信化事件经 `OnError` 以 `ErrMessageDeadLettered` 通知；默认关闭，行为不变
 
