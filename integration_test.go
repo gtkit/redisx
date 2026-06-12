@@ -1060,6 +1060,31 @@ func TestIntegrationScanKeys(t *testing.T) {
 	}
 }
 
+func TestIntegrationScanKeysCustomSeparator(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, WithKeyPrefixSeparator("."))
+	ctx := t.Context()
+
+	if err := c.Set(ctx, "user:1", "v", 0).Err(); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	var got []string
+	for key, err := range c.ScanKeys(ctx, "user:*") {
+		if err != nil {
+			t.Fatalf("ScanKeys: %v", err)
+		}
+		got = append(got, key)
+	}
+	if len(got) != 1 || got[0] != "user:1" {
+		t.Fatalf("ScanKeys = %v, want [user:1]", got)
+	}
+	if val, err := c.Get(ctx, got[0]).Result(); err != nil || val != "v" {
+		t.Errorf("回传 Get = (%q, %v), want (v, nil)", val, err)
+	}
+}
+
 func TestIntegrationXGroupManagement(t *testing.T) {
 	t.Parallel()
 

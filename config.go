@@ -12,6 +12,8 @@ import (
 // 因此前缀中一律禁止。
 const globChars = `*?[]\`
 
+const defaultKeyPrefixSeparator = ":"
+
 // DBConfig 定义单个 DB 的配置（编号 + 可选独立前缀）。
 //
 // 当 Prefix 非空时，该 DB 使用独立前缀替代全局 KeyPrefix。
@@ -63,9 +65,13 @@ type Config struct {
 	IdleTimeout time.Duration
 
 	// KeyPrefix 是全局 key 前缀。
-	// 设置后所有命令的 key 会自动拼接为 "{KeyPrefix}:{key}"。
+	// 设置后所有命令的 key 会自动拼接为 "{KeyPrefix}{KeyPrefixSeparator}{key}"。
 	// 可被 DBConfig.Prefix 覆盖。空字符串表示不使用前缀。
 	KeyPrefix string
+
+	// KeyPrefixSeparator 是 key 前缀与原始 key 之间的连接符。
+	// 默认 ":"；仅当前缀非空时参与拼接。
+	KeyPrefixSeparator string
 
 	// TLSConfig 是连接 Redis 的 TLS 配置。nil 表示不启用 TLS。
 	TLSConfig *tls.Config
@@ -78,14 +84,15 @@ type Config struct {
 // defaultConfig 返回包含生产合理默认值的 Config。
 func defaultConfig() *Config {
 	return &Config{
-		DefaultDB:    0,
-		PoolSize:     10,
-		MinIdleConns: 3,
-		MaxRetries:   3,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		IdleTimeout:  5 * time.Minute,
+		DefaultDB:          0,
+		PoolSize:           10,
+		MinIdleConns:       3,
+		MaxRetries:         3,
+		DialTimeout:        5 * time.Second,
+		ReadTimeout:        3 * time.Second,
+		WriteTimeout:       3 * time.Second,
+		IdleTimeout:        5 * time.Minute,
+		KeyPrefixSeparator: defaultKeyPrefixSeparator,
 	}
 }
 
@@ -122,6 +129,9 @@ func (c *Config) validate() error {
 	}
 	if strings.ContainsAny(c.KeyPrefix, globChars) {
 		return fmt.Errorf("redisx: key prefix %q must not contain glob characters (%s)", c.KeyPrefix, globChars)
+	}
+	if strings.ContainsAny(c.KeyPrefixSeparator, globChars) {
+		return fmt.Errorf("redisx: key prefix separator %q must not contain glob characters (%s)", c.KeyPrefixSeparator, globChars)
 	}
 	for _, dc := range c.InitDBs {
 		if strings.ContainsAny(dc.Prefix, globChars) {
@@ -179,6 +189,7 @@ func WithInitDBs(dbs ...int) Option {
 // 兼容 v1 的 WithDB(db, "prefix") 语义。
 //
 // 示例: WithDBConfig(2, "session") 使 DB2 的 key 前缀为 "session:" 而非全局前缀。
+// 前缀连接符可通过 [WithKeyPrefixSeparator] 全局配置。
 func WithDBConfig(db int, prefix string) Option {
 	return func(c *Config) {
 		c.InitDBs = append(c.InitDBs, DBConfig{DB: db, Prefix: prefix})
@@ -229,10 +240,17 @@ func WithIdleTimeout(d time.Duration) Option {
 
 // WithKeyPrefix 设置全局 key 前缀。
 //
-// 设置后所有带 key 参数的命令会自动拼接为 "{prefix}:{key}"，
+// 设置后所有带 key 参数的命令会自动拼接为 "{prefix}{separator}{key}"，
 // 对业务层完全透明。可被 per-DB 前缀覆盖（见 [WithDBConfig]）。
 func WithKeyPrefix(prefix string) Option {
 	return func(c *Config) { c.KeyPrefix = prefix }
+}
+
+// WithKeyPrefixSeparator 设置 key 前缀与原始 key 之间的连接符。
+//
+// 默认 ":"。仅当前缀非空时参与拼接；传入空字符串表示直接连接前缀和 key。
+func WithKeyPrefixSeparator(separator string) Option {
+	return func(c *Config) { c.KeyPrefixSeparator = separator }
 }
 
 // WithTLSConfig 设置连接 Redis 的 TLS 配置。

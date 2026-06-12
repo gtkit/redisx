@@ -92,7 +92,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		if prefix == "" {
 			prefix = cfg.KeyPrefix // 使用全局前缀
 		}
-		proxies[db] = &Proxy{rdb: rdb, prefix: prefix}
+		proxies[db] = &Proxy{rdb: rdb, prefix: prefix, prefixSeparator: cfg.KeyPrefixSeparator}
 	}
 
 	c := &Client{
@@ -280,9 +280,9 @@ func (c *Client) PoolStats() map[int]*redis.PoolStats {
 }
 
 // prefixKey 为 key 拼接前缀。prefix 为空时直接返回原始 key。
-func prefixKey(prefix, key string) string {
+func prefixKey(prefix, separator, key string) string {
 	if prefix == "" {
 		return key
 	}
-	return prefix + ":" + key
+	return prefix + separator + key
 }

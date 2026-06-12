@@ -55,7 +55,7 @@ func TestConsumeStreamValidation(t *testing.T) {
 func TestXAddNilAndArgsImmutable(t *testing.T) {
 	t.Parallel()
 
-	p := &Proxy{prefix: "app"}
+	p := &Proxy{prefix: "app", prefixSeparator: defaultKeyPrefixSeparator}
 	if err := p.XAdd(t.Context(), nil).Err(); err == nil || !strings.Contains(err.Error(), "args is nil") {
 		t.Errorf("nil args 期望参数错误, 得到 %v", err)
 	}

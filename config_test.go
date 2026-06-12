@@ -35,6 +35,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.IdleTimeout != 5*time.Minute {
 		t.Errorf("IdleTimeout = %v, want 5m", cfg.IdleTimeout)
 	}
+	if cfg.KeyPrefixSeparator != defaultKeyPrefixSeparator {
+		t.Errorf("KeyPrefixSeparator = %q, want %q", cfg.KeyPrefixSeparator, defaultKeyPrefixSeparator)
+	}
 	if cfg.AllowPartialInit {
 		t.Error("AllowPartialInit 默认应为 false（全有或全无）")
 	}
@@ -63,6 +66,7 @@ func TestConfigValidate(t *testing.T) {
 		{name: "MaxRetries为负", mutate: func(c *Config) { c.MaxRetries = -1 }, wantErr: "max retries must be >= 0"},
 		{name: "全局前缀含星号", mutate: func(c *Config) { c.KeyPrefix = "app*" }, wantErr: "must not contain glob characters"},
 		{name: "全局前缀含反斜杠", mutate: func(c *Config) { c.KeyPrefix = `a\b` }, wantErr: "must not contain glob characters"},
+		{name: "前缀连接符含星号", mutate: func(c *Config) { c.KeyPrefixSeparator = "*" }, wantErr: "key prefix separator"},
 		{
 			name:    "perDB前缀含方括号",
 			mutate:  func(c *Config) { c.InitDBs = []DBConfig{{DB: 1, Prefix: "tenant[3]"}} },
@@ -129,6 +133,7 @@ func TestOptionsApply(t *testing.T) {
 		WithWriteTimeout(4 * time.Second),
 		WithIdleTimeout(time.Minute),
 		WithKeyPrefix("app"),
+		WithKeyPrefixSeparator("."),
 		WithTLSConfig(tlsCfg),
 		WithAllowPartialInit(),
 	}
@@ -180,6 +185,9 @@ func TestOptionsApply(t *testing.T) {
 	}
 	if cfg.KeyPrefix != "app" {
 		t.Errorf("KeyPrefix = %q", cfg.KeyPrefix)
+	}
+	if cfg.KeyPrefixSeparator != "." {
+		t.Errorf("KeyPrefixSeparator = %q", cfg.KeyPrefixSeparator)
 	}
 	if cfg.TLSConfig != tlsCfg {
 		t.Errorf("TLSConfig = %v, want %v", cfg.TLSConfig, tlsCfg)

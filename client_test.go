@@ -14,22 +14,25 @@ func TestPrefixKey(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		prefix string
-		key    string
-		want   string
+		name      string
+		prefix    string
+		separator string
+		key       string
+		want      string
 	}{
-		{name: "空前缀", prefix: "", key: "user:1", want: "user:1"},
-		{name: "普通前缀", prefix: "app", key: "user:1", want: "app:user:1"},
-		{name: "多级前缀", prefix: "app:demo", key: "user:1", want: "app:demo:user:1"},
-		{name: "空key", prefix: "app", key: "", want: "app:"},
+		{name: "空前缀", prefix: "", separator: ":", key: "user:1", want: "user:1"},
+		{name: "普通前缀", prefix: "app", separator: ":", key: "user:1", want: "app:user:1"},
+		{name: "自定义连接符", prefix: "app", separator: ".", key: "user:1", want: "app.user:1"},
+		{name: "空连接符", prefix: "app", separator: "", key: "user:1", want: "appuser:1"},
+		{name: "多级前缀", prefix: "app:demo", separator: ":", key: "user:1", want: "app:demo:user:1"},
+		{name: "空key", prefix: "app", separator: ":", key: "", want: "app:"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := prefixKey(tt.prefix, tt.key); got != tt.want {
-				t.Errorf("prefixKey(%q, %q) = %q, want %q", tt.prefix, tt.key, got, tt.want)
+			if got := prefixKey(tt.prefix, tt.separator, tt.key); got != tt.want {
+				t.Errorf("prefixKey(%q, %q, %q) = %q, want %q", tt.prefix, tt.separator, tt.key, got, tt.want)
 			}
 		})
 	}

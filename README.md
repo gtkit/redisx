@@ -7,7 +7,7 @@
 ## 特性
 
 - 无全局变量，多实例（多服务器/多套配置）共存
-- 全局 key 前缀透明拼接，业务层无感知；支持每库（per-DB）独立前缀
+- 全局 key 前缀透明拼接，业务层无感知；支持每库（per-DB）独立前缀和自定义前缀连接符
 - 完整连接池 / 超时配置（PoolSize、MinIdleConns、DialTimeout、ReadTimeout 等）
 - 支持 TLS 连接（`WithTLSConfig`，适配云厂商强制加密实例）
 - 可选降级初始化（`WithAllowPartialInit`），失败 DB 经 `InitError` 按编号提取
@@ -69,6 +69,7 @@ token, err := c.MustSelectDB(2).Get(ctx, "token:abc").Result()
 | `WithInitDBs(dbs...)`      | 初始化多个 DB（共享全局前缀）                                  | 仅默认 DB          |
 | `WithDBConfig(db, prefix)` | 初始化单个 DB 并指定独立前缀                                   | —                 |
 | `WithKeyPrefix(prefix)`    | 全局 key 前缀                                                  | 空（不加前缀）     |
+| `WithKeyPrefixSeparator(s)` | key 前缀与原始 key 之间的连接符                                | `:`                |
 | `WithPoolSize(n)`          | 每个 DB 的最大连接数                                           | 10                 |
 | `WithMinIdleConns(n)`      | 最小空闲连接数                                                 | 3                  |
 | `WithMaxRetries(n)`        | 命令失败重试次数（非幂等命令慎用，见下文）                     | 3                  |
@@ -127,7 +128,7 @@ c, err := redisx.NewClient(
 
 ## Key 前缀机制
 
-设置 `WithKeyPrefix("myapp")` 后，所有带 key 参数的命令自动拼接为 `myapp:{key}`，业务层无感知。
+设置 `WithKeyPrefix("myapp")` 后，所有带 key 参数的命令默认自动拼接为 `myapp:{key}`，业务层无感知。可通过 `WithKeyPrefixSeparator(".")` 改为 `myapp.{key}` 等自定义格式。
 
 **前缀优先级**：`WithDBConfig` 的 per-DB 前缀 > 全局 `WithKeyPrefix` > 不加前缀。
 

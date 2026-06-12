@@ -18,19 +18,19 @@ import (
 func BenchmarkPrefixKey(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = prefixKey("app:service", "user:12345")
+		_ = prefixKey("app:service", defaultKeyPrefixSeparator, "user:12345")
 	}
 }
 
 func BenchmarkPrefixKeyEmpty(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = prefixKey("", "user:12345")
+		_ = prefixKey("", defaultKeyPrefixSeparator, "user:12345")
 	}
 }
 
 func BenchmarkProxyKeys(b *testing.B) {
-	p := &Proxy{prefix: "app:service"}
+	p := &Proxy{prefix: "app:service", prefixSeparator: defaultKeyPrefixSeparator}
 	ks := []string{"user:1", "user:2", "user:3", "user:4", "user:5", "user:6", "user:7", "user:8"}
 
 	b.ReportAllocs()

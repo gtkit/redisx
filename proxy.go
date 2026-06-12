@@ -18,13 +18,14 @@ import (
 //
 // Proxy 在 [NewClient] 中按 DB 缓存，不会重复创建。
 type Proxy struct {
-	rdb    *redis.Client
-	prefix string
+	rdb             *redis.Client
+	prefix          string
+	prefixSeparator string
 }
 
 // key 为原始 key 拼接前缀。
 func (p *Proxy) key(k string) string {
-	return prefixKey(p.prefix, k)
+	return prefixKey(p.prefix, p.prefixSeparator, k)
 }
 
 // keys 为多个 key 批量拼接前缀。
@@ -590,7 +591,7 @@ func (p *Proxy) ScanKeys(ctx context.Context, match string) iter.Seq2[string, er
 		fullMatch := p.key(match)
 		trim := ""
 		if p.prefix != "" {
-			trim = p.prefix + ":"
+			trim = prefixKey(p.prefix, p.prefixSeparator, "")
 		}
 		var cursor uint64
 		for {

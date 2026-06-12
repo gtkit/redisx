@@ -11,9 +11,19 @@ import (
 func TestProxyKey(t *testing.T) {
 	t.Parallel()
 
-	p := &Proxy{prefix: "app"}
+	p := &Proxy{prefix: "app", prefixSeparator: defaultKeyPrefixSeparator}
 	if got := p.Key("user:1"); got != "app:user:1" {
 		t.Errorf("Key() = %q, want %q", got, "app:user:1")
+	}
+
+	custom := &Proxy{prefix: "app", prefixSeparator: "."}
+	if got := custom.Key("user:1"); got != "app.user:1" {
+		t.Errorf("自定义连接符 Key() = %q, want %q", got, "app.user:1")
+	}
+
+	noSeparator := &Proxy{prefix: "app"}
+	if got := noSeparator.Key("user:1"); got != "appuser:1" {
+		t.Errorf("空连接符 Key() = %q, want %q", got, "appuser:1")
 	}
 
 	empty := &Proxy{}
@@ -25,7 +35,7 @@ func TestProxyKey(t *testing.T) {
 func TestProxyKeys(t *testing.T) {
 	t.Parallel()
 
-	p := &Proxy{prefix: "app"}
+	p := &Proxy{prefix: "app", prefixSeparator: defaultKeyPrefixSeparator}
 
 	got := p.keys([]string{"a", "b"})
 	want := []string{"app:a", "app:b"}
@@ -53,7 +63,7 @@ func TestRawClient(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	p := &Proxy{rdb: rdb, prefix: "app"}
+	p := &Proxy{rdb: rdb, prefix: "app", prefixSeparator: defaultKeyPrefixSeparator}
 	if p.RawClient() != rdb {
 		t.Error("RawClient() 应返回底层 *redis.Client 本身")
 	}
@@ -62,7 +72,7 @@ func TestRawClient(t *testing.T) {
 func TestMSetOddArguments(t *testing.T) {
 	t.Parallel()
 
-	p := &Proxy{prefix: "app"}
+	p := &Proxy{prefix: "app", prefixSeparator: defaultKeyPrefixSeparator}
 	cmd := p.MSet(t.Context(), "k1", "v1", "k2")
 	if cmd.Err() == nil {
 		t.Fatal("MSet 奇数参数期望返回错误，实际为 nil")
@@ -75,7 +85,7 @@ func TestMSetOddArguments(t *testing.T) {
 func TestMSetNonStringKey(t *testing.T) {
 	t.Parallel()
 
-	p := &Proxy{prefix: "app"}
+	p := &Proxy{prefix: "app", prefixSeparator: defaultKeyPrefixSeparator}
 	cmd := p.MSet(t.Context(), []byte("k1"), "v1")
 	if cmd.Err() == nil {
 		t.Fatal("MSet 非 string key 期望返回错误，实际为 nil")
