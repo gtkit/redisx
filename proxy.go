@@ -87,10 +87,7 @@ func (c *proxyConfig) validate() error {
 	if err := validatePrefix("channel prefix", c.channelPrefix); err != nil {
 		return err
 	}
-	if err := validatePrefix("channel prefix separator", c.channelPrefixSeparator); err != nil {
-		return err
-	}
-	return nil
+	return validatePrefix("channel prefix separator", c.channelPrefixSeparator)
 }
 
 // WithProxyPrefix 设置 [WrapClient] 返回 Proxy 的 key 前缀。

@@ -150,8 +150,8 @@ func (c *Config) validate() error {
 		return err
 	}
 	for _, dc := range c.InitDBs {
-		if strings.ContainsAny(dc.Prefix, globChars) {
-			return fmt.Errorf("redisx: db=%d prefix %q must not contain glob characters (%s)", dc.DB, dc.Prefix, globChars)
+		if err := validatePrefix(fmt.Sprintf("db=%d prefix", dc.DB), dc.Prefix); err != nil {
+			return err
 		}
 	}
 	return nil
