@@ -200,6 +200,32 @@ func TestMSetNonStringKey(t *testing.T) {
 	}
 }
 
+func TestZRangeByScoreNilOptions(t *testing.T) {
+	t.Parallel()
+
+	p := &Proxy{}
+	cmd := p.ZRangeByScore(t.Context(), "z", nil)
+	if cmd.Err() == nil {
+		t.Fatal("ZRangeByScore nil options 期望返回错误，实际为 nil")
+	}
+	if !strings.Contains(cmd.Err().Error(), "options are nil") {
+		t.Errorf("ZRangeByScore nil options 错误 = %q", cmd.Err().Error())
+	}
+}
+
+func TestEvalScriptNil(t *testing.T) {
+	t.Parallel()
+
+	p := &Proxy{}
+	cmd := p.EvalScript(t.Context(), nil, []string{"k"})
+	if cmd.Err() == nil {
+		t.Fatal("EvalScript nil script 期望返回错误，实际为 nil")
+	}
+	if !strings.Contains(cmd.Err().Error(), "script is nil") {
+		t.Errorf("EvalScript nil script 错误 = %q", cmd.Err().Error())
+	}
+}
+
 func TestConsumeArgValidation(t *testing.T) {
 	t.Parallel()
 

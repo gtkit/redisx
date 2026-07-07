@@ -203,3 +203,43 @@ func ExampleGetJSON() {
 		c.Del(ctx, key)
 	}
 }
+
+func ExampleWrapClient() {
+	rdb := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:1"})
+	defer rdb.Close()
+
+	p, err := redisx.WrapClient(
+		rdb,
+		redisx.WithProxyPrefix("app"),
+		redisx.WithProxyPrefixSeparator(":"),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(p.Key("user:1"))
+	fmt.Println(p.Keys("a", "b"))
+	// Output:
+	// app:user:1
+	// [app:a app:b]
+}
+
+func ExampleProxy_WithPrefix() {
+	rdb := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:1"})
+	defer rdb.Close()
+
+	base, err := redisx.WrapClient(rdb, redisx.WithProxyPrefix("base"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	cache, err := base.WithPrefix("cache")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(base.Key("k"))
+	fmt.Println(cache.Key("k"))
+	// Output:
+	// base:k
+	// cache:k
+}

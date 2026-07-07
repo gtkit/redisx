@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-07-07
+
+### Fixed
+
+- 修复 Stream 死信判定读取 pending 投递次数时未限定当前 consumer 的问题，避免多 consumer pending 交错时误判或漏判死信
+- 修复 `TryLock` / `Lock.Refresh` 接受小于 Redis 毫秒精度的 TTL 的问题；现在 TTL 必须至少为 `1ms`
+- 修复 `ZRangeByScore(ctx, key, nil)` 与 `EvalScript(ctx, script, nil, args...)` 因 nil 入参触发 panic 的问题，改为返回带错误的命令对象
+
+### Added
+
+- 新增 `WrapClient` 与 `Proxy.WithPrefix` 的可执行示例，确保公开示例随测试持续校验
+
+### Changed
+
+- 升级依赖：`github.com/gtkit/json/v2` 至 `v2.0.7`、`github.com/redis/go-redis/v9` 至 `v9.21.0`、`github.com/klauspost/cpuid/v2` 至 `v2.4.0`
+
+## [1.2.2] - 2026-06-12
+
 ### Added
 
 - 新增 `WithInitDBPrefix(db, prefix)` 作为 per-DB 独立前缀的首选 Option；`WithDBConfig` 保留为兼容别名并标记废弃

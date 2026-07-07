@@ -1626,6 +1626,89 @@ func TestIntegrationStreamDeadLetterViaAutoClaim(t *testing.T) {
 	waitPending(t, c, 0)
 }
 
+func TestIntegrationStreamDeadLetterFiltersCurrentConsumer(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t)
+	ctx := t.Context()
+	stream := c.Key("st")
+
+	id1 := xadd(t, c, "current-1")
+	id2 := xadd(t, c, "other")
+	id3 := xadd(t, c, "current-2")
+
+	if err := c.XGroupCreateMkStream(ctx, "st", "g1", "0").Err(); err != nil {
+		t.Fatalf("XGroupCreateMkStream: %v", err)
+	}
+	readOne := func(consumer, wantID string) {
+		t.Helper()
+		res, err := c.DefaultClient().XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group: "g1", Consumer: consumer, Streams: []string{stream, ">"}, Count: 1,
+		}).Result()
+		if err != nil {
+			t.Fatalf("XReadGroup consumer=%s: %v", consumer, err)
+		}
+		if got := res[0].Messages[0].ID; got != wantID {
+			t.Fatalf("XReadGroup consumer=%s got id=%s, want %s", consumer, got, wantID)
+		}
+	}
+	readOne("alive", id1)
+	readOne("other", id2)
+	readOne("alive", id3)
+
+	for _, id := range []string{id1, id3} {
+		if err := c.DefaultClient().XClaim(ctx, &redis.XClaimArgs{
+			Stream: stream, Group: "g1", Consumer: "alive", MinIdle: 0, Messages: []string{id},
+		}).Err(); err != nil {
+			t.Fatalf("XClaim alive id=%s: %v", id, err)
+		}
+	}
+
+	sc := &streamConsumer{
+		rdb: c.DefaultClient(),
+		cfg: StreamConfig{
+			Stream: "st", Group: "g1", Consumer: "alive",
+			MaxDeliver: 1, DeadLetterStream: "dlq",
+		},
+		stream:   stream,
+		dlStream: c.Key("dlq"),
+	}
+	msgs := []redis.XMessage{
+		{ID: id1, Values: map[string]any{"v": "current-1"}},
+		{ID: id3, Values: map[string]any{"v": "current-2"}},
+	}
+	kept, err := sc.filterDeadLetters(ctx, msgs)
+	if err != nil {
+		t.Fatalf("filterDeadLetters: %v", err)
+	}
+	if len(kept) != 0 {
+		t.Fatalf("filterDeadLetters kept %d messages, want 0; ids=%v", len(kept), kept)
+	}
+
+	dlLen, err := c.XLen(ctx, "dlq").Result()
+	if err != nil || dlLen != 2 {
+		t.Fatalf("dead-letter stream length = (%d, %v), want (2, nil)", dlLen, err)
+	}
+	alivePending, err := c.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: "st", Group: "g1", Start: "-", End: "+", Count: 10, Consumer: "alive",
+	}).Result()
+	if err != nil {
+		t.Fatalf("XPendingExt alive: %v", err)
+	}
+	if len(alivePending) != 0 {
+		t.Fatalf("alive pending = %v, want none", alivePending)
+	}
+	otherPending, err := c.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: "st", Group: "g1", Start: "-", End: "+", Count: 10, Consumer: "other",
+	}).Result()
+	if err != nil {
+		t.Fatalf("XPendingExt other: %v", err)
+	}
+	if len(otherPending) != 1 || otherPending[0].ID != id2 {
+		t.Fatalf("other pending = %v, want only %s", otherPending, id2)
+	}
+}
+
 func TestIntegrationStreamCtxCancelWhileBlocked(t *testing.T) {
 	t.Parallel()
 

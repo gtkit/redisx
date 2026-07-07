@@ -3,8 +3,8 @@ module github.com/gtkit/redisx
 go 1.26
 
 require (
-	github.com/gtkit/json/v2 v2.0.6
-	github.com/redis/go-redis/v9 v9.20.1
+	github.com/gtkit/json/v2 v2.0.7
+	github.com/redis/go-redis/v9 v9.21.0
 )
 
 require (
@@ -15,7 +15,7 @@ require (
 	github.com/cloudwego/base64x v0.1.7 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect

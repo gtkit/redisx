@@ -400,11 +400,12 @@ func (s *streamConsumer) filterDeadLetters(ctx context.Context, msgs []redis.XMe
 	}
 
 	pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: s.stream,
-		Group:  s.cfg.Group,
-		Start:  msgs[0].ID,
-		End:    msgs[len(msgs)-1].ID,
-		Count:  int64(len(msgs)),
+		Stream:   s.stream,
+		Group:    s.cfg.Group,
+		Start:    msgs[0].ID,
+		End:      msgs[len(msgs)-1].ID,
+		Count:    int64(len(msgs)),
+		Consumer: s.cfg.Consumer,
 	}).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return nil, fmt.Errorf("redisx: xpending stream=%q: %w", s.stream, err)

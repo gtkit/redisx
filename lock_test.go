@@ -21,3 +21,19 @@ func TestTryLockTTLValidation(t *testing.T) {
 		t.Errorf("Refresh ttl=0 期望参数错误, 得到 %v", err)
 	}
 }
+
+func TestLockTTLRejectsSubMillisecond(t *testing.T) {
+	t.Parallel()
+
+	p := &Proxy{}
+	if _, err := p.TryLock(t.Context(), "k", time.Nanosecond); err == nil ||
+		!strings.Contains(err.Error(), "at least 1ms") {
+		t.Fatalf("TryLock sub-ms ttl = %v, want minimum ttl error", err)
+	}
+
+	l := &Lock{}
+	if err := l.Refresh(t.Context(), time.Nanosecond); err == nil ||
+		!strings.Contains(err.Error(), "at least 1ms") {
+		t.Fatalf("Refresh sub-ms ttl = %v, want minimum ttl error", err)
+	}
+}

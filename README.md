@@ -459,7 +459,7 @@ case errors.Is(err, redisx.ErrLockLost):
 要点与边界：
 
 - `TryLock` 非阻塞；需要阻塞等待时由调用方按业务节奏循环重试（库不内置轮询策略）。冲突错误用 `errors.Is(err, ErrLockNotObtained)` 判断，错误消息携带完整 key 便于排障。
-- `ttl` 必须大于 0——无 TTL 的锁等于死锁隐患。
+- `ttl` 必须至少为 1ms——Redis TTL 精度为毫秒，无 TTL 的锁等于死锁隐患。
 - `Release` / `Refresh` 在锁已过期或被他人重新获取时返回 `ErrLockLost`，且**不会影响他人的锁**。
 - 观测自检：`lock.Key()` 返回完整锁 key（供日志/打点）；`lock.TTL(ctx)` 校验 token 后原子返回剩余时长，锁已失去返回 `ErrLockLost`。注意 TTL 仅供观测——查询与后续操作之间锁仍可能过期，互斥正确性依赖 `Release`/`Refresh` 自身的 token 校验。
 - 非 RedLock：主从异步复制下故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底。

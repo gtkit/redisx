@@ -509,6 +509,11 @@ func (p *Proxy) ZRevRange(ctx context.Context, key string, start, stop int64) *r
 //
 // 内部使用 ZRANGE ... BYSCORE 实现（ZRANGEBYSCORE 的现代等价形式，需要 Redis >= 6.2）。
 func (p *Proxy) ZRangeByScore(ctx context.Context, key string, opt *redis.ZRangeBy) *redis.StringSliceCmd {
+	if opt == nil {
+		cmd := redis.NewStringSliceCmd(ctx)
+		cmd.SetErr(errors.New("redisx: ZRangeByScore options are nil"))
+		return cmd
+	}
 	return p.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
 		Key:     p.key(key),
 		Start:   opt.Min,
@@ -743,6 +748,11 @@ func (p *Proxy) EvalSha(ctx context.Context, sha1 string, keys []string, args ..
 
 // EvalScript 执行 [*redis.Script]。keys 列表中的每个 key 自动拼接前缀。
 func (p *Proxy) EvalScript(ctx context.Context, script *redis.Script, keys []string, args ...any) *redis.Cmd {
+	if script == nil {
+		cmd := redis.NewCmd(ctx)
+		cmd.SetErr(errors.New("redisx: EvalScript script is nil"))
+		return cmd
+	}
 	return script.Run(ctx, p.rdb, p.keys(keys), args...)
 }
 

@@ -38,6 +38,16 @@ if redis.call("get", KEYS[1]) == ARGV[1] then
 end
 return -3`)
 
+func validateLockTTL(ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("redisx: lock ttl must be positive, got %v", ttl)
+	}
+	if ttl < time.Millisecond {
+		return fmt.Errorf("redisx: lock ttl must be at least %s, got %v", time.Millisecond, ttl)
+	}
+	return nil
+}
+
 // Lock 表示一把已持有的单实例分布式锁，由 [Proxy.TryLock] 获取。
 //
 // 注意语义边界：这是单 Redis 实例锁（非 RedLock），主从异步复制下
@@ -51,11 +61,11 @@ type Lock struct {
 // TryLock 尝试获取分布式锁，非阻塞。key 自动拼接前缀。
 //
 // 成功返回 [*Lock]；锁被他人持有返回 [ErrLockNotObtained]（可 errors.Is 判断）；
-// ttl 必须大于 0（无 TTL 的锁等于死锁隐患）。
+// ttl 必须至少为 1ms（Redis TTL 精度为毫秒；无 TTL 的锁等于死锁隐患）。
 // 需要阻塞等待的场景由调用方按业务节奏循环 TryLock。
 func (p *Proxy) TryLock(ctx context.Context, key string, ttl time.Duration) (*Lock, error) {
-	if ttl <= 0 {
-		return nil, fmt.Errorf("redisx: lock ttl must be positive, got %v", ttl)
+	if err := validateLockTTL(ttl); err != nil {
+		return nil, err
 	}
 
 	buf := make([]byte, 16)
@@ -158,10 +168,10 @@ func (l *Lock) Release(ctx context.Context) error {
 
 // Refresh 将锁的 TTL 重设为 ttl（校验 token 后原子执行）。
 //
-// 长任务在持有期间显式调用本方法续期；锁已失去返回 [ErrLockLost]。
+// 长任务在持有期间显式调用本方法续期；ttl 必须至少为 1ms；锁已失去返回 [ErrLockLost]。
 func (l *Lock) Refresh(ctx context.Context, ttl time.Duration) error {
-	if ttl <= 0 {
-		return fmt.Errorf("redisx: lock ttl must be positive, got %v", ttl)
+	if err := validateLockTTL(ttl); err != nil {
+		return err
 	}
 	n, err := refreshScript.Run(ctx, l.rdb, []string{l.key}, l.token, ttl.Milliseconds()).Int64()
 	if err != nil {
