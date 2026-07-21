@@ -13,7 +13,7 @@
 - 可选降级初始化（`WithAllowPartialInit`），失败 DB 经 `InitError` 按编号提取
 - `Proxy` 代理 String / Hash / List / Set / ZSet / Pub-Sub / Stream / Lua / Pipeline 的**常用命令子集**（非全量 Redis 命令），key 自动加前缀；完整命令面经 `RawClient()` / `GetClient(db)` 直接使用 go-redis；`Client` 内嵌默认 DB 代理，全部代理命令直接可用
 - `Consume` / `ConsumePattern` 受管订阅消费，`ConsumeStream` 消费组可靠消费（at-least-once）
-- 单实例分布式锁：`TryLock` / `Release` / `Refresh` / `TTL`，Lua 校验 token 杜绝误删
+- 单实例分布式锁：`TryLock` / `Release` / `Refresh` / `TTL`，Lua 校验 token 杜绝误删且对底层自动重试幂等（不产生"幽灵锁"）；`FencedLock` 额外提供单调递增 fencing token，供下游资源拒绝旧持有者
 - `DelByPattern`：SCAN + UNLINK 批量删除，异步释放内存不阻塞 Redis 主线程
 - `HealthCheck` 健康检查、`PoolStats` 连接池统计透传，监控出口齐备
 - `AddHook` 一次调用为所有 DB 挂接 go-redis Hook，外接熔断 / 限流 / metrics / tracing
@@ -25,7 +25,9 @@
 go get github.com/gtkit/redisx@latest
 ```
 
-要求 Go 1.26+、Redis >= 4.0（`DelByPattern` 依赖 UNLINK）；`GetSet`、`ZRevRange`、`ZRangeByScore`、`XAUTOCLAIM` 等现代命令实现需要 Redis >= 6.2。
+要求 Go 1.26+、**Redis >= 6.2**。
+
+本库重度依赖需要 6.2 的能力（`GetSet` 的 `SET..GET`、`ZRANGE` 的 `REV`/`BYSCORE`、`XAUTOCLAIM` 等），故最低承诺版本统一为 6.2；CI 在 Redis 6.2 / 7 / 8 上验证。
 
 ## 快速开始
 
@@ -464,6 +466,22 @@ case errors.Is(err, redisx.ErrLockLost):
 - 观测自检：`lock.Key()` 返回完整锁 key（供日志/打点）；`lock.TTL(ctx)` 校验 token 后原子返回剩余时长，锁已失去返回 `ErrLockLost`。注意 TTL 仅供观测——查询与后续操作之间锁仍可能过期，互斥正确性依赖 `Release`/`Refresh` 自身的 token 校验。
 - 非 RedLock：主从异步复制下故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底。
 - 不提供 watchdog 自动续期，生命周期由业务显式管理。
+- 获取对底层自动重试幂等：`SET NX` 因响应丢失被重发时，重发命中的锁值仍等于本次 token 亦视为获得，不会把自己已持有的锁误报为被他人持有。
+- `lock.TTL(ctx)` 在锁被外部置为无过期时间（契约外的永久锁）时返回 `ErrLockNoExpiry`，而非把死锁隐患伪装成正常。
+
+### fencing token（FencedLock）
+
+进程暂停 / GC 卡顿 / 网络阻塞会让旧持有者的锁在 TTL 过期、新持有者已拿到锁后，旧持有者仍继续操作外部资源——随机 token 只能防误删他人锁，挡不住这种"过期后仍写"。`FencedLock` 在获取时原子生成一个在同一 key 上**单调递增**的 fencing token：
+
+```go
+lock, err := c.FencedLock(ctx, "resource:42", 30*time.Second)
+if err != nil { /* errors.Is(err, redisx.ErrLockNotObtained) */ }
+defer lock.Release(ctx)
+
+writeToResource(lock.Fence(), payload) // 把 token 传给下游资源
+```
+
+`FencedLock` 嵌入 `Lock`，`Key` / `Release` / `Refresh` / `TTL` 语义完全一致，额外提供 `Fence()`。**栅栏仅在下游被保护资源记录见过的最大 token 并拒绝更小者时才生效**，本库只负责原子生成与暴露 token。fencing 计数器是一个持久（无 TTL）的 `<锁key>:__fence__`，`Release` 不删除它以保证跨获取单调，请勿手动删除。
 
 ---
 
@@ -521,7 +539,7 @@ err := c.ConsumeStream(ctx, redisx.StreamConfig{
 
 ### 死信队列（毒消息隔离）
 
-默认失败消息无限重投。配置 `MaxDeliver` + `DeadLetterStream` 后，投递次数超限的毒消息被**原子**（Lua 内 XADD + XACK，无丢失/重复窗口）转入死信流，不再阻塞消费：
+默认失败消息无限重投。配置 `MaxDeliver` + `DeadLetterStream` 后，投递次数超限的毒消息经 Lua（XADD + XACK）转入死信流，不再阻塞消费。该 Lua 只保证服务端两步不被其他命令穿插；死信投递语义为 **at-least-once**——脚本执行成功但客户端响应丢失后的重发可能重复写死信（`_redisx_origin_id` 相同），去重由下游按 `_redisx_origin_id` 负责：
 
 ```go
 err := c.ConsumeStream(ctx, redisx.StreamConfig{
@@ -660,4 +678,4 @@ c.AddHook(&breakerHook{cb: newBreaker()})
 
 ## License
 
-与 gtkit 其他包保持一致。
+MIT，详见 [LICENSE](LICENSE)。

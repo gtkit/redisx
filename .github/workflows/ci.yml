@@ -8,9 +8,16 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 最低承诺版本 6.2 + 主流 7 + 最新 8。精确到 minor 的 tag 相比漂移的
+        # 7-alpine 已是改进；如需完全消除漂移，进一步固定到镜像 digest
+        # （redis@sha256:...，需从 registry 实际拉取获取，无法离线编造）。
+        redis: ["6.2-alpine", "7.4-alpine", "8.0-alpine"]
     services:
       redis:
-        image: redis:7-alpine
+        image: redis:${{ matrix.redis }}
         ports:
           - 6379:6379
         options: >-
@@ -25,9 +32,10 @@ jobs:
           go-version-file: go.mod
       - name: Vet
         run: go vet ./...
-      - name: Test (race, real Redis)
+      - name: Test (race, real Redis required)
         env:
           REDISX_TEST_ADDR: 127.0.0.1:6379
+          REDISX_REQUIRE_REDIS: "1" # Redis 不可达时直接失败，杜绝集成测试全跳过的假绿
         run: go test -race -count=1 -timeout 10m -coverprofile=coverage.out ./...
       - name: Coverage gate (>= 80%)
         run: |
@@ -37,6 +45,7 @@ jobs:
       - name: Benchmarks compile and run once
         env:
           REDISX_TEST_ADDR: 127.0.0.1:6379
+          REDISX_REQUIRE_REDIS: "1"
         run: go test -run '^$' -bench=. -benchtime=1x ./...
 
   lint:
@@ -48,4 +57,33 @@ jobs:
           go-version-file: go.mod
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.11.4 # 钉版本，避免 latest 随新版本引入新 linter 使未改代码构建漂移
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  apicompat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gorelease 需要完整历史与 tag 做基线对比
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: 公共 API 兼容性检查 (gorelease)
+        run: |
+          go install golang.org/x/exp/cmd/gorelease@latest
+          base=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -z "$base" ]; then echo "无已发布 tag，跳过 gorelease"; exit 0; fi
+          echo "对比基线: $base"
+          gorelease -base="$base"

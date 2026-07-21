@@ -19,7 +19,9 @@ const (
 // 经 [StreamConfig.OnError] 通知业务时可 errors.Is 判别。
 var ErrMessageDeadLettered = errors.New("redisx: message dead-lettered")
 
-// 死信消息附加的元数据字段名（下划线前缀避让业务字段）。
+// 死信消息附加的元数据字段名。_redisx_ 前缀用于降低与业务字段碰撞概率；
+// 万一业务字段同名，写入时元数据置于业务字段之后，XADD 同名字段后者胜，
+// 保证元数据不被业务字段污染（见 deadLetter）。
 const (
 	deadLetterFieldOriginStream = "_redisx_origin_stream"
 	deadLetterFieldOriginID     = "_redisx_origin_id"
@@ -27,9 +29,12 @@ const (
 	deadLetterFieldDeadAt       = "_redisx_dead_at"
 )
 
-// deadLetterScript 原子完成"写死信流 + ACK 原消息"，消除两步间崩溃导致的
-// 死信丢失或重复窗口。KEYS[1]=源流，KEYS[2]=死信流；ARGV[1]=group，
-// ARGV[2]=原消息 ID，ARGV[3..]=死信消息的 field-value 序列。
+// deadLetterScript 原子完成"写死信流 + ACK 原消息"，保证服务端两步不被其他
+// 命令穿插。注意这是 at-least-once：脚本已在服务端执行成功但客户端未收到响应
+// 而重发时，会再写一条死信（_redisx_origin_id 相同），本库不承诺 exactly-once，
+// 去重由下游死信消费者依据 _redisx_origin_id 负责。KEYS[1]=源流，KEYS[2]=死信流；
+// ARGV[1]=group，ARGV[2]=原消息 ID，ARGV[3..]=死信消息的 field-value 序列
+// （业务字段在前、_redisx_* 元数据在后）。
 var deadLetterScript = redis.NewScript(`
 local fields = {}
 for i = 3, #ARGV do
@@ -74,8 +79,11 @@ type StreamConfig struct {
 	// DeadLetterStream 是死信流名，自动拼接前缀。MaxDeliver > 0 时必填，
 	// 且不得与 Stream 同名。死信消息保留原消息全部字段，并附加
 	// _redisx_origin_stream / _redisx_origin_id / _redisx_deliveries /
-	// _redisx_dead_at 元数据。死信流的裁剪、监控与重放由业务负责，
-	// 库内不做 MAXLEN 限制——无人消费时请业务侧自行 XTrimMaxLen。
+	// _redisx_dead_at 元数据（同名业务字段会被元数据遮蔽）。
+	//
+	// 死信转移语义为 at-least-once：客户端重试可能重复写入（_redisx_origin_id
+	// 相同），下游消费者应按 _redisx_origin_id 幂等去重。死信流的裁剪、监控与
+	// 重放由业务负责，库内不做 MAXLEN 限制——无人消费时请业务侧自行 XTrimMaxLen。
 	DeadLetterStream string
 
 	// OnError 可选：handler 返回业务 error 时被同步调用（此时消息不 ACK，
@@ -431,17 +439,19 @@ func (s *streamConsumer) filterDeadLetters(ctx context.Context, msgs []redis.XMe
 
 // deadLetter 将消息原子转入死信流并 ACK 原消息，随后经 OnError 通知业务。
 func (s *streamConsumer) deadLetter(ctx context.Context, m redis.XMessage, deliveries int64) error {
-	args := make([]any, 0, 2+2*4+2*len(m.Values))
+	args := make([]any, 0, 2+2*len(m.Values)+2*4)
+	args = append(args, s.cfg.Group, m.ID)
+	// 先拼业务字段、再拼 _redisx_* 元数据：XADD 同名字段后者胜，元数据置后
+	// 保证不被同名业务字段污染
+	for k, v := range m.Values {
+		args = append(args, k, v)
+	}
 	args = append(args,
-		s.cfg.Group, m.ID,
 		deadLetterFieldOriginStream, s.stream,
 		deadLetterFieldOriginID, m.ID,
 		deadLetterFieldDeliveries, deliveries,
 		deadLetterFieldDeadAt, time.Now().UTC().Format(time.RFC3339),
 	)
-	for k, v := range m.Values {
-		args = append(args, k, v)
-	}
 
 	if err := deadLetterScript.Run(ctx, s.rdb, []string{s.stream, s.dlStream}, args...).Err(); err != nil {
 		return fmt.Errorf("redisx: dead-letter stream=%q id=%s: %w", s.stream, m.ID, err)

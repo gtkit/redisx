@@ -204,6 +204,32 @@ func ExampleGetJSON() {
 	}
 }
 
+// ExampleProxy_FencedLock 演示带 fencing token 的锁：token 单调递增，
+// 供下游被保护资源拒绝较旧持有者（仅当下游校验 token 时栅栏才生效）。
+func ExampleProxy_FencedLock() {
+	c, err := redisx.NewClient(redisx.WithAddr("127.0.0.1:6379"), redisx.WithKeyPrefix("app"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx := context.Background()
+
+	lock, err := c.FencedLock(ctx, "resource:42", 30*time.Second)
+	if errors.Is(err, redisx.ErrLockNotObtained) {
+		fmt.Println("他人持有，跳过本轮")
+		return
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer lock.Release(ctx)
+
+	// 把 fence 传给下游资源；下游记录见过的最大 token 并拒绝更小者
+	fence := lock.Fence()
+	_ = fence
+}
+
 func ExampleWrapClient() {
 	rdb := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:1"})
 	defer rdb.Close()

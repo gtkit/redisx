@@ -2,10 +2,12 @@ package redisx
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -34,11 +36,8 @@ type Client struct {
 
 // NewClient 使用 Functional Options 创建 Redis 客户端。
 //
-// 初始化时会对每个 DB 执行 Ping 检查连通性，任一失败则返回错误并清理所有已创建的连接。
-// 启用 [WithAllowPartialInit] 后改为降级语义：失败的 DB 缺席集合，错误以
-// [*InitError] 返回（与可用的 Client 可同时非 nil，可经 errors.As 按 DB 提取失败原因），
-// 但 DefaultDB 仍必须初始化成功，否则整体失败返回 nil。
-// clients/proxies map 在构建完成后不再修改，后续并发读取无需加锁。
+// 等价于以 context.Background() 调用 [NewClientContext]；需要约束或取消
+// 初始化耗时的场景请直接使用 [NewClientContext]。
 //
 // 用法:
 //
@@ -49,6 +48,20 @@ type Client struct {
 //	    redisx.WithInitDBs(0, 1, 2),
 //	)
 func NewClient(opts ...Option) (*Client, error) {
+	return NewClientContext(context.Background(), opts...)
+}
+
+// NewClientContext 与 [NewClient] 相同，但初始化拨号与 Ping 均受传入 ctx 约束：
+// ctx 取消或超时立即中止初始化并回收已建连接。
+//
+// 初始化对每个 DB 执行 Ping 检查连通性：DefaultDB 优先拨号，失败立即整体失败且
+// 不再拨号其余 DB；其余 DB 并发拨号以缩短启动时间。非降级模式下任一失败即返回
+// 确定性错误（编号最小的失败 DB）并清理所有已创建的连接。启用 [WithAllowPartialInit]
+// 后改为降级语义：失败的 DB 缺席集合，错误以 [*InitError] 返回（与可用的 Client
+// 可同时非 nil，可经 errors.As 按 DB 提取失败原因，且与 DB 编号确定对应、不受并发
+// 完成顺序影响），但 DefaultDB 仍必须初始化成功，否则整体失败返回 nil。
+// clients/proxies map 在构建完成后不再修改，后续并发读取无需加锁。
+func NewClientContext(ctx context.Context, opts ...Option) (*Client, error) {
 	cfg := defaultConfig()
 	for _, o := range opts {
 		o(cfg)
@@ -80,7 +93,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		}
 	}
 
-	clients, failed, err := dialAll(cfg, dbPrefixes)
+	clients, failed, err := dialAll(ctx, cfg, dbPrefixes)
 	if err != nil {
 		return nil, err
 	}
@@ -114,13 +127,57 @@ func NewClient(opts ...Option) (*Client, error) {
 	return c, nil
 }
 
+// normalizeMaxRetries 映射本库语义到 go-redis：本库 MaxRetries=0 表示关闭重试，
+// 而 go-redis 中 0 是"默认 3 次"、-1 才是关闭。
+func normalizeMaxRetries(n int) int {
+	if n == 0 {
+		return -1
+	}
+	return n
+}
+
+// dialDB 为单个 DB 建立连接并在 ctx 约束下 Ping 验证；失败时关闭连接并返回错误。
+//
+// 每个 DB 从 ctx 派生独立超时上限，避免多 DB 共享一个总超时导致后续 DB 被误判。
+// 启用 TLS 时使用 cfg.TLSConfig 的独立副本，避免多个 client 共享同一 *tls.Config
+// 被 go-redis 拨号期写入字段而相互影响。
+func dialDB(ctx context.Context, cfg *Config, db int) (*redis.Client, error) {
+	var tlsCfg *tls.Config
+	if cfg.TLSConfig != nil {
+		tlsCfg = cfg.TLSConfig.Clone()
+	}
+	rdb := redis.NewClient(&redis.Options{
+		Addr:            cfg.Addr,
+		Username:        cfg.Username,
+		Password:        cfg.Password,
+		DB:              db,
+		PoolSize:        cfg.PoolSize,
+		MinIdleConns:    cfg.MinIdleConns,
+		MaxRetries:      normalizeMaxRetries(cfg.MaxRetries),
+		DialTimeout:     cfg.DialTimeout,
+		ReadTimeout:     cfg.ReadTimeout,
+		WriteTimeout:    cfg.WriteTimeout,
+		ConnMaxIdleTime: cfg.IdleTimeout,
+		TLSConfig:       tlsCfg,
+	})
+
+	pingCtx, pingCancel := context.WithTimeout(ctx, cfg.DialTimeout+2*time.Second)
+	pingFail := rdb.Ping(pingCtx).Err()
+	pingCancel()
+	if pingFail != nil {
+		_ = rdb.Close()
+		return nil, fmt.Errorf("redisx: ping db=%d addr=%s: %w", db, cfg.Addr, pingFail)
+	}
+	return rdb, nil
+}
+
 // dialAll 为每个 DB 建立连接并 Ping 验证。
 //
-// DefaultDB 优先拨号：它承载 Client 级快捷方法必须成功，失败时立即
-// fail-fast，其余 DB 无需再拨号；其余 DB 按编号升序，错误信息确定有序。
-// 返回成功的连接集合与降级模式下各 DB 的失败原因；
-// 非降级模式（或 DefaultDB）失败时关闭全部已建连接并返回 error。
-func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Client, failed map[int]error, err error) {
+// DefaultDB 优先同步拨号：它承载 Client 级快捷方法必须成功，失败时立即 fail-fast，
+// 其余 DB 无需再拨号。其余 DB 并发拨号以缩短启动时间；结果按 DB 编号确定性聚合，
+// 不依赖并发完成顺序。返回成功的连接集合与降级模式下各 DB 的失败原因；非降级模式
+// 下任一非默认 DB 失败时关闭全部已建连接并返回编号最小失败 DB 的确定性错误。
+func dialAll(ctx context.Context, cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Client, failed map[int]error, err error) {
 	clients = make(map[int]*redis.Client, len(dbPrefixes))
 	cleanup := func() {
 		for _, rdb := range clients {
@@ -128,58 +185,66 @@ func dialAll(cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Cli
 		}
 	}
 
-	order := make([]int, 0, len(dbPrefixes))
-	order = append(order, cfg.DefaultDB)
+	// DefaultDB 优先同步拨号，失败立即整体 fail-fast、不拨其余
+	defaultRDB, derr := dialDB(ctx, cfg, cfg.DefaultDB)
+	if derr != nil {
+		return nil, nil, derr
+	}
+	clients[cfg.DefaultDB] = defaultRDB
+
+	// 其余 DB 升序收集后并发拨号
+	rest := make([]int, 0, len(dbPrefixes))
 	for _, db := range slices.Sorted(maps.Keys(dbPrefixes)) {
 		if db != cfg.DefaultDB {
-			order = append(order, db)
+			rest = append(rest, db)
 		}
 	}
-
-	// 本库语义：MaxRetries=0 表示关闭重试；go-redis 中 0 是"默认 3 次"、-1 才是关闭
-	maxRetries := cfg.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = -1
+	if len(rest) == 0 {
+		return clients, nil, nil
 	}
 
-	for _, db := range order {
-		rdb := redis.NewClient(&redis.Options{
-			Addr:            cfg.Addr,
-			Username:        cfg.Username,
-			Password:        cfg.Password,
-			DB:              db,
-			PoolSize:        cfg.PoolSize,
-			MinIdleConns:    cfg.MinIdleConns,
-			MaxRetries:      maxRetries,
-			DialTimeout:     cfg.DialTimeout,
-			ReadTimeout:     cfg.ReadTimeout,
-			WriteTimeout:    cfg.WriteTimeout,
-			ConnMaxIdleTime: cfg.IdleTimeout,
-			TLSConfig:       cfg.TLSConfig,
-		})
+	type dialResult struct {
+		db  int
+		rdb *redis.Client
+		err error
+	}
+	// 每个 goroutine 只写自己的结果槽（按 rest 升序索引），wg.Wait 后串行聚合，
+	// 无共享写、无需锁；聚合顺序由 rest 决定，与完成顺序无关
+	results := make([]dialResult, len(rest))
+	var wg sync.WaitGroup
+	for i, db := range rest {
+		wg.Add(1)
+		go func(i, db int) {
+			defer wg.Done()
+			rdb, e := dialDB(ctx, cfg, db)
+			results[i] = dialResult{db: db, rdb: rdb, err: e}
+		}(i, db)
+	}
+	wg.Wait()
 
-		// 每个 DB 独立超时，避免多 DB 串行 Ping 共享一个总超时导致后续 DB 被误判
-		pingCtx, pingCancel := context.WithTimeout(context.Background(), cfg.DialTimeout+2*time.Second)
-		pingFail := rdb.Ping(pingCtx).Err()
-		pingCancel()
-		if pingFail != nil {
-			_ = rdb.Close() // 关闭当前这个也要关
-			pingErr := fmt.Errorf("redisx: ping db=%d addr=%s: %w", db, cfg.Addr, pingFail)
-			// 降级模式下非默认 DB 失败只记录不中断；默认 DB 承载 Client 级快捷方法，必须成功
-			if cfg.AllowPartialInit && db != cfg.DefaultDB {
+	var firstErr error // rest 升序 → 首个错误即编号最小失败
+	for _, r := range results {
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			// 降级模式下非默认 DB 失败只记录不中断
+			if cfg.AllowPartialInit {
 				if failed == nil {
 					failed = make(map[int]error)
 				}
-				failed[db] = pingErr
-				continue
+				failed[r.db] = r.err
 			}
-			// DefaultDB 优先拨号保证走到这里时 failed 必为空：
-			// 要么是 DefaultDB 自身失败（首个拨号），要么是非降级模式（不积累 failed）
-			cleanup()
-			return nil, nil, pingErr
+			continue
 		}
+		clients[r.db] = r.rdb
+	}
 
-		clients[db] = rdb
+	// 非降级模式：任一非默认 DB 失败则整体失败，回收全部已建连接（含 DefaultDB 与
+	// 已成功的非默认 DB），返回确定性错误
+	if !cfg.AllowPartialInit && firstErr != nil {
+		cleanup()
+		return nil, nil, firstErr
 	}
 
 	return clients, failed, nil
@@ -198,19 +263,28 @@ func (c *Client) Close() error {
 	return errors.Join(errs...)
 }
 
-// HealthCheck 对所有已初始化的 DB 执行 PING 健康检查。
+// HealthCheck 对所有已初始化的 DB 并发执行 PING 健康检查。
 //
-// 不会短路：即使某个 DB 失败也会继续检查其余 DB，最终返回所有失败的聚合错误。
-// 返回 nil 表示全部健康。
+// 不会短路：即使某个 DB 失败也会检查其余 DB，最终以 [errors.Join] 返回所有失败的
+// 聚合错误（按 DB 编号确定有序，不受并发完成顺序影响）。返回 nil 表示全部健康。
 func (c *Client) HealthCheck(ctx context.Context) error {
-	var errs []error
-	for db, rdb := range c.clients {
-		if err := rdb.Ping(ctx).Err(); err != nil {
-			errs = append(errs, fmt.Errorf("db=%d ping: %w", db, err))
-		}
+	dbs := slices.Sorted(maps.Keys(c.clients))
+	// 每个 goroutine 只写自己的错误槽（按 dbs 升序索引），wg.Wait 后聚合，无共享写
+	errs := make([]error, len(dbs))
+	var wg sync.WaitGroup
+	for i, db := range dbs {
+		wg.Add(1)
+		go func(i, db int) {
+			defer wg.Done()
+			if err := c.clients[db].Ping(ctx).Err(); err != nil {
+				errs[i] = fmt.Errorf("db=%d ping: %w", db, err)
+			}
+		}(i, db)
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("redisx: health check failed: %w", errors.Join(errs...))
+	wg.Wait()
+
+	if joined := errors.Join(errs...); joined != nil {
+		return fmt.Errorf("redisx: health check failed: %w", joined)
 	}
 	return nil
 }

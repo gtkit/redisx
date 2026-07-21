@@ -4,6 +4,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 `NewClientContext(ctx, opts...)`：上下文感知初始化，ctx 取消/超时即中止拨号并回收已建连接；`NewClient` 等价于以 `context.Background()` 调用它
+- 新增 `Proxy.FencedLock` 与 `FencedLock` 类型：带单调递增 fencing token 的分布式锁，供下游资源拒绝旧持有者（嵌入 `Lock`，复用 `Release`/`Refresh`/`TTL`）
+- 新增哨兵错误 `ErrLockNoExpiry`：`Lock.TTL` 遇到锁存在但无过期时间（契约外的永久锁）时返回，取代此前误判为 `0, nil`
+- 补充 `LICENSE`（MIT）文件
+
+### Changed
+
+- 多 DB 初始化改为并发拨号（DefaultDB 仍优先且失败 fail-fast），缩短多库启动耗时；`HealthCheck` 改并发执行；两者结果均按 DB 编号确定聚合，不受并发完成顺序影响
+- TLS 配置对每个底层 client 使用 `tls.Config.Clone()`，避免多 client 共享同一 `*tls.Config` 被 go-redis 拨号期写字段而相互影响
+- 死信元数据 `_redisx_*` 字段现写在业务字段之后，保证同名业务字段不再污染元数据
+- 最低支持 Redis 版本明确为 **6.2**（此前 README 混写 4.0/6.2）；CI 在 Redis 6.2 / 7 / 8 上验证
+
+### Fixed
+
+- 修复 `TryLock` 在 go-redis 自动重试下的"幽灵锁"：`SET NX` 服务端成功但响应丢失、重试返回 false 时，调用方拿不到 `*Lock` 而锁被占到 TTL。改用单段 Lua（NX 失败则 GET 核对 token），获取对底层重试幂等
+- 更正死信语义描述：1.2.0 记为"XADD + XACK 无丢失/重复窗口"不准确。Lua 仅保证服务端两步不被穿插，死信投递实为 **at-least-once**——客户端重试可能重复写死信（`_redisx_origin_id` 相同），去重由下游按 `_redisx_origin_id` 负责
+
 ## [1.2.3] - 2026-07-07
 
 ### Fixed

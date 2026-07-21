@@ -62,6 +62,11 @@ func testRedisAddr(tb testing.TB) string {
 	}
 	conn, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
+		// CI 设置 REDISX_REQUIRE_REDIS=1 时，Redis 不可达直接失败而非跳过，
+		// 避免"集成测试全跳过但 CI 仍通过"的假绿
+		if os.Getenv("REDISX_REQUIRE_REDIS") != "" {
+			tb.Fatalf("REDISX_REQUIRE_REDIS 已设置但真实 Redis 不可达 (%s): %v", addr, err)
+		}
 		tb.Skipf("真实 Redis 不可达 (%s)，跳过集成测试: %v", addr, err)
 	}
 	_ = conn.Close()
