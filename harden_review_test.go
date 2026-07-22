@@ -72,12 +72,12 @@ func TestIntegrationFencedLock(t *testing.T) {
 	}
 
 	// 互斥：持有期间他人获取失败
-	if _, err := c.FencedLock(ctx, "fk", time.Minute); !errors.Is(err, ErrLockNotObtained) {
-		t.Fatalf("持锁期间再获取 = %v, want ErrLockNotObtained", err)
+	if _, e := c.FencedLock(ctx, "fk", time.Minute); !errors.Is(e, ErrLockNotObtained) {
+		t.Fatalf("持锁期间再获取 = %v, want ErrLockNotObtained", e)
 	}
 
-	if err := l1.Release(ctx); err != nil {
-		t.Fatalf("Release #1: %v", err)
+	if e := l1.Release(ctx); e != nil {
+		t.Fatalf("Release #1: %v", e)
 	}
 
 	// 释放后再获取，fence 严格前进
@@ -198,7 +198,7 @@ func TestIntegrationConcurrentInitPartialFailure(t *testing.T) {
 func TestNewClientContextCanceled(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel() // 立即取消
 
 	c, err := NewClientContext(ctx, WithAddr("127.0.0.1:6379"))
@@ -223,7 +223,7 @@ func TestHealthCheckAggregatesAllFailures(t *testing.T) {
 	}}
 	defer c.Close()
 
-	err := c.HealthCheck(context.Background())
+	err := c.HealthCheck(t.Context())
 	if err == nil {
 		t.Fatal("HealthCheck = nil, want 聚合错误")
 	}

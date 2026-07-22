@@ -97,7 +97,7 @@ func newLockToken() (string, error) {
 func acquireLock(ctx context.Context, rdb *redis.Client, key, token string, ttl time.Duration) (bool, error) {
 	n, err := acquireScript.Run(ctx, rdb, []string{key}, token, ttl.Milliseconds()).Int64()
 	if err != nil {
-		return false, err
+		return false, err //nolint:wrapcheck // 调用方 TryLock/FencedLock 以完整 key 上下文统一包装
 	}
 	return n == 1, nil
 }

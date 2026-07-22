@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-21
+
 ### Added
 
 - 新增 `NewClientContext(ctx, opts...)`：上下文感知初始化，ctx 取消/超时即中止拨号并回收已建连接；`NewClient` 等价于以 `context.Background()` 调用它

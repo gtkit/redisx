@@ -89,9 +89,11 @@ token, err := c.MustSelectDB(2).Get(ctx, "token:abc").Result()
 
 ### 初始化语义
 
-- `NewClient` 会对每个声明的 DB 建立独立连接池并执行 PING 验证，**DefaultDB 优先拨号**：它承载 Client 级快捷方法，失败时立即整体失败，其余 DB 不再拨号；其余 DB 按编号升序拨号，错误信息确定有序。
+- `NewClient` 会对每个声明的 DB 建立独立连接池并执行 PING 验证，**DefaultDB 优先拨号**：它承载 Client 级快捷方法，失败时立即整体失败、其余 DB 不再拨号；其余 DB **并发拨号**以缩短启动时间，结果按 DB 编号确定聚合，错误信息不受并发完成顺序影响。
+- `NewClientContext(ctx, opts...)` 与 `NewClient` 相同，但初始化拨号与 PING 均受传入 `ctx` 约束：`ctx` 取消或超时即中止初始化并回收已建连接。`NewClient` 等价于以 `context.Background()` 调用它，需要约束启动耗时或支持取消的场景请用 `NewClientContext`。
 - 默认**全有或全无**：任一 DB 验证失败，整体返回错误并回收已建连接。
-- `clients` / `proxies` 集合在构建完成后只读，后续并发使用无需加锁。
+- TLS 配置对每个底层 client 使用独立副本（`tls.Config.Clone()`），多 DB 间互不影响。
+- `clients` / `proxies` 集合在构建完成后只读，后续并发使用无需加锁；`HealthCheck` 对各 DB 并发 PING 并聚合全部失败（不短路）。
 
 ### 降级初始化与 InitError
 
