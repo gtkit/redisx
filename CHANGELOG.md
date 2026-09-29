@@ -4,6 +4,28 @@
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-29
+
+### Added
+
+- 新增 `WithContextTimeoutEnabled()`：透传 go-redis `ContextTimeoutEnabled`，让命令级 ctx deadline 也约束 socket 读写；默认关闭，与 go-redis 一致
+
+### Changed
+
+- `FencedLock` 的 fencing 计数器不再永久存在：仍为 `<锁key>:__fence__`（与锁 key 同 slot，集群下锁 key 带 hash tag 即可），每次获取续期 24h；fence 改为 `max(计数器, 客户端毫秒时间<<10) + 1`，计数器过期或被删后由时间下界保证仍大于历史值。此前高基数锁 key 会留下等量的永久计数器。v1.3.0 的无 TTL 计数器在首次获取时自动获得 TTL，token 不回退。⚠ 升级后 token 量级从小整数跳到约 1.8×10^15（仍小于 2^53，JSON / JavaScript Number 可精确表示），下游记录 fence 的存储字段必须是 64 位整数（如 MySQL `BIGINT`），32 位整数列会溢出
+- `Client.Prefix()` 改为返回默认 DB 实际生效的前缀：被 `WithInitDBPrefix(默认DB, x)` 覆盖时返回 x，与 `Key()` 拼出的 key 一致；此前返回全局前缀，与实际 key 不符
+- README 与 GoDoc 如实描述默认下 ctx 取消的响应上限（普通命令 `ReadTimeout × (MaxRetries + 1)`，`ConsumeStream` 阻塞读取 `Block + ReadTimeout`）、`Lock.Release` 在自动重试下的假阳性 `ErrLockLost`、消费循环出错即返回需外层重启、空前缀下 `DelByPattern("*")` 等同清库
+
+### Deprecated
+
+- `Proxy.SetEX`：与 `Set` 实现完全相同，请直接使用 `Set`
+
+### Fixed
+
+- 修复 `Consume` / `ConsumePattern` 订阅确认无超时的问题：go-redis 在该路径只把 ctx 的 Deadline 用作读期限，仅可取消的 ctx 遇到不回确认的服务端会永久阻塞且取消无效。现改用 `ReceiveTimeout`，超时取底层 client 的 `ReadTimeout`
+- 修复死信脚本在集群代理（如阿里云代理模式）上因 Lua 预检不支持 `unpack` 而失败的问题：字段对数不超过 96 时按对数生成参数逐个列出的脚本并缓存，更宽的消息回退到原 `unpack` 形式
+- 修复降级模式（`WithAllowPartialInit`）下 ctx 取消被当作 DB 故障的问题：此前会返回可用 Client 与 `InitError`，现与非降级模式一致，中止初始化并回收已建连接
+
 ## [1.3.0] - 2026-07-21
 
 ### Added

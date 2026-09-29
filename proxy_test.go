@@ -1,9 +1,16 @@
 package redisx
 
 import (
+	"bufio"
+	"context"
+	"errors"
+	"net"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -242,5 +249,132 @@ func TestConsumeArgValidation(t *testing.T) {
 	}
 	if err := p.ConsumePattern(t.Context(), func(*redis.Message) {}); err == nil || !strings.Contains(err.Error(), "at least one pattern") {
 		t.Errorf("ConsumePattern 空模式期望参数错误, 得到 %v", err)
+	}
+}
+
+// silentSubscribeServer 启动一个最小 RESP 服务端：握手命令正常应答（HELLO 回 Redis
+// 错误让 go-redis 降级到 RESP2，CLIENT 回 +OK），对 SUBSCRIBE / PSUBSCRIBE 不回复。
+// 只"接受连接但不回复"的服务端会让超时发生在握手阶段，测不到订阅确认。
+func silentSubscribeServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			go serveSilentSubscribe(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func serveSilentSubscribe(conn net.Conn) {
+	rd := bufio.NewReader(conn)
+	for {
+		args, err := readRESPArray(rd)
+		if err != nil {
+			return
+		}
+		var reply string
+		switch strings.ToUpper(args[0]) {
+		case "HELLO":
+			reply = "-ERR unknown command 'HELLO'\r\n"
+		case "SUBSCRIBE", "PSUBSCRIBE":
+			continue
+		default:
+			reply = "+OK\r\n"
+		}
+		if _, err := conn.Write([]byte(reply)); err != nil {
+			return
+		}
+	}
+}
+
+func readRESPArray(rd *bufio.Reader) ([]string, error) {
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "*")))
+	if err != nil || n <= 0 {
+		return nil, errors.New("bad array header")
+	}
+	args := make([]string, n)
+	for i := range args {
+		if _, err := rd.ReadString('\n'); err != nil { // $len
+			return nil, err
+		}
+		v, err := rd.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		args[i] = strings.TrimRight(v, "\r\n")
+	}
+	return args, nil
+}
+
+// TestConsumeConfirmationBounded 验证订阅确认受 ReadTimeout 约束：服务端不回确认、
+// ctx 只可取消无 deadline 时，Consume / ConsumePattern 按读超时返回而不永久阻塞。
+func TestConsumeConfirmationBounded(t *testing.T) {
+	t.Parallel()
+
+	for name, consume := range map[string]func(context.Context, *Proxy) error{
+		"Consume": func(ctx context.Context, p *Proxy) error {
+			return p.Consume(ctx, func(*redis.Message) {}, "ch")
+		},
+		"ConsumePattern": func(ctx context.Context, p *Proxy) error {
+			return p.ConsumePattern(ctx, func(*redis.Message) {}, "ch:*")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rdb := redis.NewClient(&redis.Options{
+				Addr:        silentSubscribeServer(t),
+				ReadTimeout: 300 * time.Millisecond,
+				MaxRetries:  -1,
+			})
+			t.Cleanup(func() { _ = rdb.Close() })
+			p, err := WrapClient(rdb)
+			if err != nil {
+				t.Fatalf("WrapClient: %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- consume(ctx, p) }()
+
+			select {
+			case err := <-done:
+				var ne net.Error
+				if !errors.As(err, &ne) || !ne.Timeout() {
+					t.Fatalf("返回 %v，期望订阅确认阶段的读超时错误", err)
+				}
+			case <-time.After(3 * time.Second):
+				cancel() // 旧实现下取消同样无效，这里只为不留孤儿 goroutine
+				t.Fatal("订阅确认未受 ReadTimeout 约束，3s 内未返回")
+			}
+		})
 	}
 }

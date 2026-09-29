@@ -3,7 +3,10 @@ package redisx
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -229,5 +232,350 @@ func TestHealthCheckAggregatesAllFailures(t *testing.T) {
 	}
 	if msg := err.Error(); !strings.Contains(msg, "db=0") || !strings.Contains(msg, "db=1") {
 		t.Errorf("聚合错误应同时含 db=0 与 db=1，得到: %v", msg)
+	}
+}
+
+// TestIntegrationFencedLockCounterBounded 验证 fencing 计数器与锁 key 同 slot 命名
+// （锁 key 追加 ":__fence__"）、带不超过 24h 的 TTL、不产生额外 key；fence 不小于
+// 获取前的时间下界、与计数器值逐位一致；同毫秒内连续获取严格递增；计数器被删后
+// 由时间下界接管仍严格递增。
+func TestIntegrationFencedLockCounterBounded(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t)
+	ctx := t.Context()
+	raw := c.DefaultClient()
+
+	before := time.Now().UnixMilli() << fenceTimeShift
+	l, err := c.FencedLock(ctx, "{order:1}", time.Minute)
+	if err != nil {
+		t.Fatalf("FencedLock: %v", err)
+	}
+	after := time.Now().UnixMilli()
+	counter := l.Key() + ":__fence__"
+
+	if l.Fence() <= before {
+		t.Errorf("fence = %d, want > 时间下界 %d", l.Fence(), before)
+	}
+	if ms := l.Fence() >> fenceTimeShift; ms > after {
+		t.Errorf("fence>>%d = %d 晚于获取完成时刻 %d", fenceTimeShift, ms, after)
+	}
+	if v, gerr := raw.Get(ctx, counter).Result(); gerr != nil || v != strconv.FormatInt(l.Fence(), 10) {
+		t.Errorf("计数器 %s = (%q, %v), want %d（数值必须精确）", counter, v, gerr, l.Fence())
+	}
+	if ttl, terr := raw.PTTL(ctx, counter).Result(); terr != nil || ttl <= 0 || ttl > fenceCounterTTL {
+		t.Errorf("计数器 PTTL = (%v, %v), want (0, %v]", ttl, terr, fenceCounterTTL)
+	}
+	if rerr := l.Release(ctx); rerr != nil {
+		t.Fatalf("Release: %v", rerr)
+	}
+
+	// 命名空间内只剩这一个计数器，没有全局计数器
+	var keys []string
+	for k, serr := range c.ScanKeys(ctx, "*") {
+		if serr != nil {
+			t.Fatalf("ScanKeys: %v", serr)
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) != 1 || keys[0] != "{order:1}:__fence__" {
+		t.Errorf("释放后残留 key = %v, want 仅 [{order:1}:__fence__]", keys)
+	}
+
+	// 同毫秒内连续获取仍严格递增（依靠计数器 +1，而非时间）
+	prev := l.Fence()
+	for i := range 50 {
+		li, lerr := c.FencedLock(ctx, "{order:1}", time.Minute)
+		if lerr != nil {
+			t.Fatalf("第 %d 次 FencedLock: %v", i, lerr)
+		}
+		if li.Fence() <= prev {
+			t.Fatalf("第 %d 次 fence = %d, want > %d", i, li.Fence(), prev)
+		}
+		prev = li.Fence()
+		_ = li.Release(ctx)
+	}
+
+	// 计数器被删（等价过期）后，时间下界接管，仍严格大于历史值
+	if derr := raw.Del(ctx, counter).Err(); derr != nil {
+		t.Fatalf("Del counter: %v", derr)
+	}
+	l2, err := c.FencedLock(ctx, "{order:1}", time.Minute)
+	if err != nil {
+		t.Fatalf("FencedLock after counter delete: %v", err)
+	}
+	if l2.Fence() <= prev {
+		t.Errorf("计数器删除后 fence = %d, want > %d", l2.Fence(), prev)
+	}
+	_ = l2.Release(ctx)
+}
+
+// TestIntegrationFencedLockLegacyCounter 验证 v1.3.0 写入的小整数无 TTL 计数器：
+// 新 fence 严格大于旧值且不小于时间下界，计数器获得 TTL。
+func TestIntegrationFencedLockLegacyCounter(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t)
+	ctx := t.Context()
+	raw := c.DefaultClient()
+	counter := c.Key("legacy") + ":__fence__"
+
+	if err := raw.Set(ctx, counter, 41, 0).Err(); err != nil {
+		t.Fatalf("seed legacy counter: %v", err)
+	}
+	before := time.Now().UnixMilli() << fenceTimeShift
+	l, err := c.FencedLock(ctx, "legacy", time.Minute)
+	if err != nil {
+		t.Fatalf("FencedLock: %v", err)
+	}
+	defer l.Release(ctx)
+
+	if l.Fence() <= 41 || l.Fence() <= before {
+		t.Errorf("fence = %d, want > max(41, %d)", l.Fence(), before)
+	}
+	if ttl, err := raw.PTTL(ctx, counter).Result(); err != nil || ttl <= 0 {
+		t.Errorf("旧计数器获取后 PTTL = (%v, %v), want > 0", ttl, err)
+	}
+}
+
+// TestIntegrationFencedAcquireSelfRetry 验证获取脚本对底层重试幂等：同 token 重发
+// 返回本次已分配的同一 fence，不重复计数；不同 token 返回 -1。
+func TestIntegrationFencedAcquireSelfRetry(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t)
+	ctx := t.Context()
+	lockKey := c.Key("retry")
+	keys := []string{lockKey, lockKey + fenceKeySuffix}
+	run := func(token string) int64 {
+		t.Helper()
+		floor := time.Now().UnixMilli() << fenceTimeShift
+		n, err := fencedAcquireScript.Run(ctx, c.DefaultClient(), keys,
+			token, time.Minute.Milliseconds(), floor, fenceCounterTTL.Milliseconds()).Int64()
+		if err != nil {
+			t.Fatalf("fencedAcquireScript(%s): %v", token, err)
+		}
+		return n
+	}
+
+	first := run("tokenA")
+	if first <= 0 {
+		t.Fatalf("首次获取 fence = %d, want > 0", first)
+	}
+	if again := run("tokenA"); again != first {
+		t.Errorf("同 token 重发 fence = %d, want %d（不得重复计数）", again, first)
+	}
+	if other := run("tokenB"); other != -1 {
+		t.Errorf("他人持有时 = %d, want -1", other)
+	}
+}
+
+// TestIntegrationDeadLetterWideMessages 验证死信脚本字面量形式上限（92 个业务字段 +
+// 4 个元数据 = 96 对）与回退 unpack 形式（93 个）两侧，死信消息字段与元数据完整。
+func TestIntegrationDeadLetterWideMessages(t *testing.T) {
+	t.Parallel()
+
+	for _, fields := range []int{92, 93} {
+		t.Run(strconv.Itoa(fields), func(t *testing.T) {
+			t.Parallel()
+
+			c := newTestClient(t)
+			ctx := t.Context()
+			values := make(map[string]any, fields)
+			for i := range fields {
+				values[fmt.Sprintf("f%d", i)] = i
+			}
+			id, err := c.XAdd(ctx, &redis.XAddArgs{Stream: "st", Values: values}).Result()
+			if err != nil {
+				t.Fatalf("XAdd: %v", err)
+			}
+
+			var attempts, deadLettered atomic.Int32
+			cfg := streamCfg("c1")
+			cfg.MaxDeliver = 1
+			cfg.DeadLetterStream = "dlq"
+			cfg.OnError = func(_ redis.XMessage, e error) {
+				if errors.Is(e, ErrMessageDeadLettered) {
+					deadLettered.Add(1)
+				}
+			}
+			failing := func(redis.XMessage) error {
+				attempts.Add(1)
+				return errors.New("boom")
+			}
+			runConsumeUntil(t, c, cfg, failing, func() bool { return attempts.Load() >= 1 })
+			runConsumeUntil(t, c, cfg, failing, func() bool { return deadLettered.Load() >= 1 })
+
+			dl, err := c.XRange(ctx, "dlq", "-", "+").Result()
+			if err != nil || len(dl) != 1 {
+				t.Fatalf("死信流 XRange = (%v, %v), want 1 条", dl, err)
+			}
+			got := dl[0].Values
+			if len(got) != fields+4 {
+				t.Errorf("死信字段数 = %d, want %d", len(got), fields+4)
+			}
+			for i := range fields {
+				if got[fmt.Sprintf("f%d", i)] != strconv.Itoa(i) {
+					t.Fatalf("字段 f%d = %v, want %d", i, got[fmt.Sprintf("f%d", i)], i)
+				}
+			}
+			if got["_redisx_origin_id"] != id || got["_redisx_origin_stream"] != c.Key("st") {
+				t.Errorf("元数据 = (%v, %v), want (%s, %s)",
+					got["_redisx_origin_id"], got["_redisx_origin_stream"], id, c.Key("st"))
+			}
+		})
+	}
+}
+
+// TestIntegrationPrefixFollowsDefaultDB 验证 Prefix() 返回默认 DB 实际生效的前缀，
+// 被 WithInitDBPrefix(默认DB, x) 覆盖时与 Key() 拼出的 key 一致。
+func TestIntegrationPrefixFollowsDefaultDB(t *testing.T) {
+	t.Parallel()
+
+	override := testPrefix(t) + "_d0"
+	c := newTestClient(t, WithInitDBPrefix(0, override))
+	if c.Prefix() != override {
+		t.Errorf("Prefix() = %q, want %q", c.Prefix(), override)
+	}
+	if want := override + ":k"; c.Key("k") != want {
+		t.Errorf("Key(k) = %q, want %q", c.Key("k"), want)
+	}
+}
+
+// flipCtx 在第 n 次 Done() 调用时变为已取消，用于遍历初始化过程中的全部取消时机。
+type flipCtx struct {
+	context.Context
+
+	n     int32
+	calls atomic.Int32
+	ch    chan struct{}
+	once  sync.Once
+}
+
+func newFlipCtx(n int32) *flipCtx {
+	return &flipCtx{Context: context.Background(), n: n, ch: make(chan struct{})}
+}
+
+func (f *flipCtx) Done() <-chan struct{} {
+	if f.calls.Add(1) >= f.n {
+		f.once.Do(func() { close(f.ch) })
+	}
+	return f.ch
+}
+
+func (f *flipCtx) Err() error {
+	select {
+	case <-f.ch:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+// TestIntegrationPartialInitCtxCancelAborts 验证降级模式下 ctx 取消不被当作 DB 故障：
+// 无论在哪个时机取消，都不会返回"Client 与错误同时非 nil"。同时断言至少一次命中
+// "默认 DB 已成功、非默认 DB 因取消失败"的路径，防止测试因取消时机偏移而空转。
+//
+// 实测（go-redis v9.21）目标路径落在第 4~13 次 Done() 取消，其后为完整成功；遍历
+// 到 24 留足余量。关闭空闲连接预热并限制遍历次数，是为了避免大量短连接进入
+// TIME_WAIT 耗尽本机临时端口，干扰同时运行的其他拨号测试。
+func TestIntegrationPartialInitCtxCancelAborts(t *testing.T) {
+	t.Parallel()
+
+	addr := testRedisAddr(t)
+	hitNonDefault := 0
+	for n := int32(1); n <= 24; n++ {
+		c, err := NewClientContext(newFlipCtx(n), WithAddr(addr), WithKeyPrefix(testPrefix(t)),
+			WithMinIdleConns(0), WithInitDBs(1, 2, 3), WithAllowPartialInit())
+		if c != nil {
+			_ = c.Close()
+			if err != nil {
+				t.Fatalf("n=%d：ctx 取消后返回了可用 Client 与错误 %v，应整体中止", n, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("n=%d：Client 与错误同时为 nil", n)
+		}
+		for _, db := range []string{"db=1", "db=2", "db=3"} {
+			if strings.Contains(err.Error(), "ping "+db+" ") {
+				hitNonDefault++
+				break
+			}
+		}
+	}
+	if hitNonDefault == 0 {
+		t.Fatal("未命中'默认 DB 成功、非默认 DB 因取消失败'的路径，测试未覆盖目标分支")
+	}
+}
+
+// TestIntegrationContextTimeoutEnabled 验证 WithContextTimeoutEnabled 透传到每个 DB，
+// 且开启后 ctx deadline 能截断阻塞读：Block=3s 的 ConsumeStream 在 300ms deadline
+// 附近返回 DeadlineExceeded，而不是等满 Block。
+func TestIntegrationContextTimeoutEnabled(t *testing.T) {
+	t.Parallel()
+
+	plain := newTestClient(t, WithInitDBs(1))
+	for db := range plain.PoolStats() {
+		if rdb, _ := plain.GetClient(db); rdb.Options().ContextTimeoutEnabled {
+			t.Errorf("默认 db=%d ContextTimeoutEnabled = true, want false", db)
+		}
+	}
+
+	c := newTestClient(t, WithInitDBs(1), WithContextTimeoutEnabled())
+	for db := range c.PoolStats() {
+		if rdb, _ := c.GetClient(db); !rdb.Options().ContextTimeoutEnabled {
+			t.Errorf("db=%d ContextTimeoutEnabled = false, want true", db)
+		}
+	}
+
+	cfg := streamCfg("c1")
+	cfg.Block = 3 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := c.ConsumeStream(ctx, cfg, func(redis.XMessage) error { return nil })
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("ConsumeStream 在 %v 后才返回，ctx deadline 未截断阻塞读", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("ConsumeStream = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+// TestIntegrationStreamCommandErrorTerminates 验证消费中途 Redis 命令出错（消费组被
+// 删除，XREADGROUP 返回 NOGROUP）时 ConsumeStream 立即返回携带流名的错误，
+// 库内不重试。
+func TestIntegrationStreamCommandErrorTerminates(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.ConsumeStream(ctx, streamCfg("c1"), func(redis.XMessage) error { return nil }) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if groups, err := c.XInfoGroups(t.Context(), "st").Result(); err == nil && len(groups) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("等待消费组创建超时")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := c.XGroupDestroy(t.Context(), "st", "g1").Err(); err != nil {
+		t.Fatalf("XGroupDestroy: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil || errors.Is(err, context.Canceled) ||
+			!strings.Contains(err.Error(), "NOGROUP") || !strings.Contains(err.Error(), c.Key("st")) {
+			t.Errorf("ConsumeStream = %v, want 携带流名的 NOGROUP 错误", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("消费组删除后 ConsumeStream 3s 内未返回")
 	}
 }

@@ -185,8 +185,7 @@ func (p *Proxy) Set(ctx context.Context, key string, value any, expiration time.
 
 // SetEX 设置 key-value 并指定过期时间。key 自动拼接前缀。
 //
-// 内部使用 SET 带过期实现（SETEX 的现代等价形式）；
-// expiration 为 0 时等同于无过期时间的 SET。
+// Deprecated: 与 [Proxy.Set] 实现完全相同，请直接使用 Set。
 func (p *Proxy) SetEX(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd {
 	return p.rdb.Set(ctx, p.key(key), value, expiration)
 }
@@ -576,9 +575,13 @@ func (p *Proxy) PSubscribe(ctx context.Context, patterns ...string) *redis.PubSu
 
 // Consume 以受管方式订阅频道并串行消费消息，阻塞直到 ctx 取消或出错。
 //
-// 订阅生命周期由库内管理：订阅确认失败立即返回错误，退出时自动关闭订阅；
-// ctx 取消时返回 ctx 的错误（可用 errors.Is(err, context.Canceled) 判断优雅退出）；
-// handler panic 会被恢复，消费终止并以 error 返回。
+// 订阅生命周期由库内管理：订阅确认受底层 client 的 ReadTimeout 约束，服务端
+// 在读超时内未回确认即返回错误；退出时自动关闭订阅；ctx 取消时返回 ctx 的错误
+// （可用 errors.Is(err, context.Canceled) 判断优雅退出）；handler panic 会被恢复，
+// 消费终止并以 error 返回。
+//
+// 任何订阅连接错误都会终止消费并以 error 返回，库内不重连；需要长期消费的
+// 调用方应在外层循环中带退避地重新调用本方法。
 //
 // handler 串行执行以保证单频道消息顺序，耗时处理请在业务侧自行分发。
 // 注意 Redis Pub/Sub 为 at-most-once，断线期间的消息会丢失；
@@ -590,7 +593,7 @@ func (p *Proxy) Consume(ctx context.Context, handler func(*redis.Message), chann
 	if len(channels) == 0 {
 		return errors.New("redisx: consume requires at least one channel")
 	}
-	return consumeSub(ctx, p.rdb.Subscribe(ctx, p.channels(channels)...), handler, channels)
+	return consumeSub(ctx, p.rdb.Subscribe(ctx, p.channels(channels)...), p.rdb.Options().ReadTimeout, handler, channels)
 }
 
 // ConsumePattern 以受管方式按模式订阅（PSUBSCRIBE）并串行消费消息，
@@ -602,16 +605,20 @@ func (p *Proxy) ConsumePattern(ctx context.Context, handler func(*redis.Message)
 	if len(patterns) == 0 {
 		return errors.New("redisx: consume requires at least one pattern")
 	}
-	return consumeSub(ctx, p.rdb.PSubscribe(ctx, p.channels(patterns)...), handler, patterns)
+	return consumeSub(ctx, p.rdb.PSubscribe(ctx, p.channels(patterns)...), p.rdb.Options().ReadTimeout, handler, patterns)
 }
 
 // consumeSub 是 Consume / ConsumePattern 共用的受管消费循环：
 // 同步确认订阅、退出关闭订阅、ctx 取消返回其错误、handler panic 转为 error。
-func consumeSub(ctx context.Context, sub *redis.PubSub, handler func(*redis.Message), names []string) error {
+//
+// 确认阶段必须带 timeout：go-redis 在该路径只把 ctx 的 Deadline 用作读期限，
+// 仅可取消、无 deadline 的 ctx 遇到不回确认的服务端会永久阻塞。timeout 取底层
+// client 的 ReadTimeout，用户显式关闭读超时（负值）时同样不设期限。
+func consumeSub(ctx context.Context, sub *redis.PubSub, timeout time.Duration, handler func(*redis.Message), names []string) error {
 	defer sub.Close()
 
 	// 同步确认订阅成功，连接不可用时立即返回而非静默空转
-	if _, err := sub.Receive(ctx); err != nil {
+	if _, err := sub.ReceiveTimeout(ctx, timeout); err != nil {
 		return fmt.Errorf("redisx: subscribe %v: %w", names, err)
 	}
 
@@ -653,6 +660,10 @@ func safeHandle(handler func(*redis.Message), msg *redis.Message) (err error) {
 // 大 value 场景不会阻塞 Redis 主线程（需要 Redis >= 4.0）。
 //
 // 建议调用方传入带超时的 ctx 控制执行时间。返回成功删除的 key 总数。
+//
+// 前缀是唯一的隔离边界：未配置前缀时 pattern "*" 匹配当前 DB 的全部 key，
+// 等同清空该 DB。[Proxy.FencedLock] 的计数器 key 也在前缀命名空间内，宽 pattern
+// 会把它一并删除，此后该锁的 fence 单调性退化为依赖时间下界。
 func (p *Proxy) DelByPattern(ctx context.Context, pattern string) (int64, error) {
 	fullPattern := p.key(pattern)
 	var (

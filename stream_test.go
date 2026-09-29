@@ -1,7 +1,10 @@
 package redisx
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -106,5 +109,49 @@ func TestHandleBizErrorInvokesOnError(t *testing.T) {
 	s.cfg.OnError = func(redis.XMessage, error) { panic("callback boom") }
 	if err := s.handle(t.Context(), msg); err == nil || !strings.Contains(err.Error(), "OnError panic") {
 		t.Errorf("回调 panic 期望终止错误, 得到 %v", err)
+	}
+}
+
+// TestDeadLetterScriptFor 验证死信脚本在 ≤96 对时为参数逐个列出、不含 unpack 的
+// 字面量形式（兼容做 Lua 预检的集群代理），按对数缓存，超出时回退 unpack 形式。
+// go-redis 的 Script 不暴露源码，以"期望文本的 SHA1 等于 Hash()"断言文本。
+func TestDeadLetterScriptFor(t *testing.T) {
+	t.Parallel()
+
+	sha := func(src string) string {
+		sum := sha1.Sum([]byte(src))
+		return hex.EncodeToString(sum[:])
+	}
+	const tail = "\nreturn redis.call(\"xack\", KEYS[1], ARGV[1], ARGV[2])"
+
+	// pairs=1 的期望文本手写，不复用生产代码的生成逻辑
+	one := `redis.call("xadd", KEYS[2], "*", ARGV[3], ARGV[4])` + tail
+	if got := deadLetterScriptFor(1).Hash(); got != sha(one) {
+		t.Errorf("pairs=1 脚本文本不符，期望:\n%s", one)
+	}
+
+	var b strings.Builder
+	b.WriteString(`redis.call("xadd", KEYS[2], "*"`)
+	for i := 3; i <= 2+2*96; i++ {
+		fmt.Fprintf(&b, ", ARGV[%d]", i)
+	}
+	b.WriteString(")" + tail)
+	if got := deadLetterScriptFor(96).Hash(); got != sha(b.String()) {
+		t.Error("pairs=96 应为字面量形式且覆盖全部 192 个字段参数")
+	}
+
+	for _, pairs := range []int{1, 50, 96} {
+		s := deadLetterScriptFor(pairs)
+		if s == deadLetterUnpackScript {
+			t.Errorf("pairs=%d 不应使用 unpack 形式", pairs)
+		}
+		if deadLetterScriptFor(pairs) != s {
+			t.Errorf("pairs=%d 未命中缓存", pairs)
+		}
+	}
+	for _, pairs := range []int{97, 1000} {
+		if deadLetterScriptFor(pairs) != deadLetterUnpackScript {
+			t.Errorf("pairs=%d 应回退 unpack 形式", pairs)
+		}
 	}
 }

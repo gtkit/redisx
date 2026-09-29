@@ -34,16 +34,39 @@ if redis.call("get", KEYS[1]) == ARGV[1] then
 end
 return 0`)
 
-// fenceKeySuffix 是 fencing 计数器 key 相对锁 key 的固定后缀。计数器持久存在
-// （无 TTL、Release 不删除），以保证 fencing token 跨获取严格单调递增。
+// fenceKeySuffix 是 fencing 计数器 key 相对锁 key 的固定后缀。后缀拼在完整锁 key
+// 之后，锁 key 含 hash tag 时计数器沿用同一 tag，与锁 key 同 slot——集群下 Lua 的
+// 多个 KEYS 必须同 slot，这是计数器按锁 key 一一对应而非全局共用的原因。
 const fenceKeySuffix = ":__fence__"
 
-// fencedAcquireScript 原子获取带 fencing token 的锁：SET NX PX 成功则 INCR 计数器
-// 返回新 fence；自获取重试（当前值等于本次 token）返回已分配的同一 fence 不重复计数；
-// 被他人持有返回 -1。KEYS[1]=锁 key，KEYS[2]=计数器 key，ARGV[1]=token，ARGV[2]=ttl_ms。
+// fenceCounterTTL 是计数器的存活期，每次获取续期。计数器只在存活期内提供"严格
+// 递增"的状态；过期后由时间下界（见 fenceTimeShift）接管单调性，因此高基数锁 key
+// 的计数器不会永久累积。
+const fenceCounterTTL = 24 * time.Hour
+
+// fenceTimeShift 是时间下界的位宽：floor = 客户端 Unix 毫秒 << 10。fence 取
+// max(计数器, floor) + 1，计数器缺失或过期时仍大于历史值。取 10 位而非更宽是为了
+// 让全部数值保持在 2^53 以内（到 2248 年），Redis 内 Lua 的 double 比较才精确；
+// 同一 key 同一毫秒内超过 1024 次获取才会让 fence 暂时跑到时间下界前面，
+// 此时仍靠计数器 +1 严格递增。
+const fenceTimeShift = 10
+
+// fencedAcquireScript 原子获取带 fencing token 的锁：SET NX PX 成功后，计数器
+// 小于时间下界则先以下界覆盖（下界以字符串原样写入，不经 Lua 数字转字符串），
+// 随后 INCR（服务端 64 位整数运算）并续期，返回新 fence；自获取重试（当前值等于
+// 本次 token）返回计数器当前值——本持有者持锁期间无人能推进该 key 的计数器，
+// 因此恰为本次已分配的 fence；被他人持有返回 -1。
+// KEYS[1]=锁 key，KEYS[2]=计数器 key，ARGV[1]=token，ARGV[2]=ttl_ms，
+// ARGV[3]=时间下界，ARGV[4]=计数器 TTL ms。
 var fencedAcquireScript = redis.NewScript(`
 if redis.call("set", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
-	return redis.call("incr", KEYS[2])
+	local cur = redis.call("get", KEYS[2])
+	if not cur or tonumber(cur) < tonumber(ARGV[3]) then
+		redis.call("set", KEYS[2], ARGV[3])
+	end
+	local n = redis.call("incr", KEYS[2])
+	redis.call("pexpire", KEYS[2], ARGV[4])
+	return n
 end
 if redis.call("get", KEYS[1]) == ARGV[1] then
 	return tonumber(redis.call("get", KEYS[2]))
@@ -152,6 +175,8 @@ func (p *Proxy) TryLock(ctx context.Context, key string, ttl time.Duration) (*Lo
 //
 // 不做自动续期：fn 预计耗时必须显著小于 ttl，长任务请自行分段或在 fn 内
 // 通过 [Proxy.TryLock] 返回的 Lock 显式 Refresh。
+//
+// 释放阶段的 [ErrLockLost] 在底层自动重试下存在假阳性，见 [Lock.Release]。
 func (p *Proxy) WithLock(ctx context.Context, key string, ttl time.Duration, fn func(ctx context.Context) error) error {
 	if fn == nil {
 		return errors.New("redisx: with lock fn is nil")
@@ -217,6 +242,10 @@ func (l *Lock) TTL(ctx context.Context) (time.Duration, error) {
 
 // Release 释放锁。仅当锁仍被当前持有者持有（token 匹配）时删除；
 // 锁已过期或被他人重新获取时返回 [ErrLockLost]，且不会影响他人的锁。
+//
+// 底层自动重试下 [ErrLockLost] 存在假阳性：DEL 已在服务端执行但响应丢失，重发时
+// token 已不匹配，返回 ErrLockLost 而锁实际由本持有者正常释放。库内无法区分这两种
+// 情况；把 ErrLockLost 当作"互斥已破坏"触发补偿的场景请 [WithMaxRetries] 设为 0。
 func (l *Lock) Release(ctx context.Context) error {
 	n, err := unlockScript.Run(ctx, l.rdb, []string{l.key}, l.token).Int64()
 	if err != nil {
@@ -258,6 +287,7 @@ type FencedLock struct {
 
 // Fence 返回本次获取的 fencing token。同一 key 上后获得者的 token 严格大于
 // 先获得者（可能有间隙，但不回退、不重复），供下游被保护资源拒绝较旧持有者。
+// token 右移 10 位即获取时刻的近似 Unix 毫秒，可用于排障。
 func (l *FencedLock) Fence() int64 {
 	return l.fence
 }
@@ -274,10 +304,12 @@ func (l *FencedLock) Fence() int64 {
 // 成功返回 [*FencedLock]；锁被他人持有返回 [ErrLockNotObtained]（errors.Is 判断）；
 // ttl 必须至少为 1ms。获取路径与 TryLock 一样对底层自动重试幂等。
 //
-// 实现说明：fencing token 由一个持久（无 TTL）的计数器 key 提供（锁 key 追加
-// ":__fence__" 后缀），Release 不删除该计数器以保证跨获取单调。该计数器 key 会
-// 长期存在，且可能被 [Proxy.DelByPattern] 的宽 pattern 扫到，请勿手动删除，
-// 否则单调性重置。
+// 实现说明：fencing token = max(计数器, 客户端 Unix 毫秒<<10) + 1，计数器 key 为
+// "<完整锁key>:__fence__"（与锁 key 同 slot，锁 key 含 hash tag 时沿用同一 tag，
+// 集群可用），每次获取续期 24h，不永久存在。计数器存活期内严格递增与时钟无关；
+// 24h 无人获取、计数器过期后由时间下界接管，此时要打破单调，前后两次获取的客户端
+// 时钟偏差需超过 24h。计数器被 [Proxy.DelByPattern] 的宽 pattern 删除时同样退化为
+// 依赖时间下界，不会重置为小值。v1.3.0 写入的无 TTL 计数器在首次获取时自动获得 TTL。
 func (p *Proxy) FencedLock(ctx context.Context, key string, ttl time.Duration) (*FencedLock, error) {
 	if err := validateLockTTL(ttl); err != nil {
 		return nil, err
@@ -289,8 +321,9 @@ func (p *Proxy) FencedLock(ctx context.Context, key string, ttl time.Duration) (
 	}
 
 	fullKey := p.key(key)
-	fenceKey := fullKey + fenceKeySuffix
-	fence, err := fencedAcquireScript.Run(ctx, p.rdb, []string{fullKey, fenceKey}, token, ttl.Milliseconds()).Int64()
+	floor := time.Now().UnixMilli() << fenceTimeShift
+	fence, err := fencedAcquireScript.Run(ctx, p.rdb, []string{fullKey, fullKey + fenceKeySuffix},
+		token, ttl.Milliseconds(), floor, fenceCounterTTL.Milliseconds()).Int64()
 	if err != nil {
 		return nil, fmt.Errorf("redisx: fenced lock key=%q: %w", fullKey, err)
 	}

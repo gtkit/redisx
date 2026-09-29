@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -29,19 +30,50 @@ const (
 	deadLetterFieldDeadAt       = "_redisx_dead_at"
 )
 
-// deadLetterScript 原子完成"写死信流 + ACK 原消息"，保证服务端两步不被其他
-// 命令穿插。注意这是 at-least-once：脚本已在服务端执行成功但客户端未收到响应
-// 而重发时，会再写一条死信（_redisx_origin_id 相同），本库不承诺 exactly-once，
-// 去重由下游死信消费者依据 _redisx_origin_id 负责。KEYS[1]=源流，KEYS[2]=死信流；
+// 死信脚本原子完成"写死信流 + ACK 原消息"，保证服务端两步不被其他命令穿插。
+// 注意这是 at-least-once：脚本已在服务端执行成功但客户端未收到响应而重发时，
+// 会再写一条死信（_redisx_origin_id 相同），本库不承诺 exactly-once，去重由下游
+// 死信消费者依据 _redisx_origin_id 负责。KEYS[1]=源流，KEYS[2]=死信流；
 // ARGV[1]=group，ARGV[2]=原消息 ID，ARGV[3..]=死信消息的 field-value 序列
 // （业务字段在前、_redisx_* 元数据在后）。
-var deadLetterScript = redis.NewScript(`
+//
+// 字段对数不超过 deadLetterLiteralMaxPairs 时按对数生成 XADD 参数逐个列出的
+// 字面量形式：集群代理（如阿里云代理模式）会对 Lua 做语法预检且不支持 unpack。
+// Lua 5.1 单个调用表达式约 250 个寄存器上限（实测 240 个参数可执行、250 编译
+// 失败），96 对即 195 个参数留有余量。超出时回退到 unpack 形式，开源 Redis 上
+// 容量不变。
+const deadLetterLiteralMaxPairs = 96
+
+const deadLetterScriptTail = "\nreturn redis.call(\"xack\", KEYS[1], ARGV[1], ARGV[2])"
+
+var deadLetterUnpackScript = redis.NewScript(`
 local fields = {}
 for i = 3, #ARGV do
 	fields[#fields+1] = ARGV[i]
 end
-redis.call("xadd", KEYS[2], "*", unpack(fields))
-return redis.call("xack", KEYS[1], ARGV[1], ARGV[2])`)
+redis.call("xadd", KEYS[2], "*", unpack(fields))` + deadLetterScriptTail)
+
+// deadLetterScripts 按字段对数缓存字面量形式脚本；去重由 LoadOrStore 保证，
+// 竞争下多构造一次只是浪费一个字符串。
+var deadLetterScripts sync.Map
+
+func deadLetterScriptFor(pairs int) *redis.Script {
+	if pairs > deadLetterLiteralMaxPairs {
+		return deadLetterUnpackScript
+	}
+	if s, ok := deadLetterScripts.Load(pairs); ok {
+		return s.(*redis.Script) //nolint:errcheck // 只存入 *redis.Script，断言不会失败
+	}
+	var b strings.Builder
+	b.WriteString(`redis.call("xadd", KEYS[2], "*"`)
+	for i := range 2 * pairs {
+		fmt.Fprintf(&b, ", ARGV[%d]", 3+i)
+	}
+	b.WriteString(")")
+	b.WriteString(deadLetterScriptTail)
+	s, _ := deadLetterScripts.LoadOrStore(pairs, redis.NewScript(b.String()))
+	return s.(*redis.Script) //nolint:errcheck // 同上
+}
 
 // StreamConfig 定义 [Proxy.ConsumeStream] 受管消费组的配置。
 type StreamConfig struct {
@@ -84,6 +116,10 @@ type StreamConfig struct {
 	// 死信转移语义为 at-least-once：客户端重试可能重复写入（_redisx_origin_id
 	// 相同），下游消费者应按 _redisx_origin_id 幂等去重。死信流的裁剪、监控与
 	// 重放由业务负责，库内不做 MAXLEN 限制——无人消费时请业务侧自行 XTrimMaxLen。
+	//
+	// 集群部署：死信转移经 Lua 同时操作源流与死信流，两者必须同 slot，请给
+	// Stream 与 DeadLetterStream 使用同一 hash tag（如 "{orders}" 与 "{orders}:dlq"）。
+	// 消息字段不超过 92 个时脚本不含 unpack，兼容做 Lua 语法预检的集群代理。
 	DeadLetterStream string
 
 	// OnError 可选：handler 返回业务 error 时被同步调用（此时消息不 ACK，
@@ -229,6 +265,12 @@ func (p *Proxy) XPendingExt(ctx context.Context, args *redis.XPendingExtArgs) *r
 // 持续失败的消息默认堆积在 pending（请业务侧用 [Proxy.XPending] 监控）；
 // 配置 [StreamConfig.MaxDeliver] + [StreamConfig.DeadLetterStream] 可在
 // 投递超限后将毒消息原子隔离到死信流，不再阻塞重投。
+//
+// 任何 Redis 命令错误（XREADGROUP / XACK / XPENDING / XAUTOCLAIM，含瞬时网络
+// 错误）都会终止消费并以 error 返回，库内不重试也不重连；未确认的消息留在
+// pending，重启后续传。需要长期消费的调用方应在外层循环中带退避地重新调用本
+// 方法。默认下 ctx 取消在 XREADGROUP 阻塞期间不被观察，最多再等 Block+ReadTimeout
+// 才返回；需要更快响应请缩短 Block 或开启 [WithContextTimeoutEnabled]。
 //
 // 库内不提供 handler 超时控制（Go 无法安全中断不配合的函数），长耗时处理
 // 请在 handler 内自行用 context 控制；[StreamConfig.OnError] 回调中如需
@@ -453,7 +495,8 @@ func (s *streamConsumer) deadLetter(ctx context.Context, m redis.XMessage, deliv
 		deadLetterFieldDeadAt, time.Now().UTC().Format(time.RFC3339),
 	)
 
-	if err := deadLetterScript.Run(ctx, s.rdb, []string{s.stream, s.dlStream}, args...).Err(); err != nil {
+	script := deadLetterScriptFor(4 + len(m.Values))
+	if err := script.Run(ctx, s.rdb, []string{s.stream, s.dlStream}, args...).Err(); err != nil {
 		return fmt.Errorf("redisx: dead-letter stream=%q id=%s: %w", s.stream, m.ID, err)
 	}
 	if s.cfg.OnError != nil {

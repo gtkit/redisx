@@ -29,7 +29,6 @@ type Client struct {
 	*Proxy // 默认 DB 的命令代理，方法提升为 Client 级快捷方式
 
 	defaultDB int                   // 默认 DB 编号
-	keyPrefix string                // 全局 key 前缀
 	clients   map[int]*redis.Client // 初始化后只读，无需锁保护
 	proxies   map[int]*Proxy        // 初始化后只读，每个 DB 对应一个缓存的 Proxy
 }
@@ -59,8 +58,13 @@ func NewClient(opts ...Option) (*Client, error) {
 // 确定性错误（编号最小的失败 DB）并清理所有已创建的连接。启用 [WithAllowPartialInit]
 // 后改为降级语义：失败的 DB 缺席集合，错误以 [*InitError] 返回（与可用的 Client
 // 可同时非 nil，可经 errors.As 按 DB 提取失败原因，且与 DB 编号确定对应、不受并发
-// 完成顺序影响），但 DefaultDB 仍必须初始化成功，否则整体失败返回 nil。
-// clients/proxies map 在构建完成后不再修改，后续并发读取无需加锁。
+// 完成顺序影响），但 DefaultDB 仍必须初始化成功，否则整体失败返回 nil；ctx 取消
+// 造成的失败不走降级，同样整体中止并回收。
+//
+// 默认下 ctx 只约束拨号与取连接，Ping 的 socket 读取仍受 ReadTimeout 约束，
+// 因此取消后最多再等 ReadTimeout；需要 ctx deadline 直接截断读取请开启
+// [WithContextTimeoutEnabled]。clients/proxies map 在构建完成后不再修改，后续并发
+// 读取无需加锁。
 func NewClientContext(ctx context.Context, opts ...Option) (*Client, error) {
 	cfg := defaultConfig()
 	for _, o := range opts {
@@ -80,12 +84,12 @@ func NewClientContext(ctx context.Context, opts ...Option) (*Client, error) {
 	// 收集并去重需要初始化的 DB，同时记录 per-DB 前缀
 	// key=db号, value=该 DB 的前缀（空字符串表示使用全局前缀）
 	dbPrefixes := make(map[int]string)
-	dbPrefixes[cfg.DefaultDB] = "" // DefaultDB 始终使用全局前缀
+	dbPrefixes[cfg.DefaultDB] = "" // 未被 WithInitDBPrefix 覆盖时使用全局前缀
 	for _, dc := range cfg.InitDBs {
 		if dc.DB < 0 {
 			return nil, fmt.Errorf("redisx: invalid db %d in init list, must be >= 0", dc.DB)
 		}
-		// 后设置的 per-DB 前缀优先；如果已有条目且新条目有前缀则覆盖
+		// 后设置的 per-DB 前缀优先（含 DefaultDB）；已有条目且新条目无前缀则保留
 		if dc.Prefix != "" {
 			dbPrefixes[dc.DB] = dc.Prefix
 		} else if _, exists := dbPrefixes[dc.DB]; !exists {
@@ -117,7 +121,6 @@ func NewClientContext(ctx context.Context, opts ...Option) (*Client, error) {
 	c := &Client{
 		Proxy:     proxies[cfg.DefaultDB],
 		defaultDB: cfg.DefaultDB,
-		keyPrefix: cfg.KeyPrefix,
 		clients:   clients,
 		proxies:   proxies,
 	}
@@ -159,6 +162,8 @@ func dialDB(ctx context.Context, cfg *Config, db int) (*redis.Client, error) {
 		WriteTimeout:    cfg.WriteTimeout,
 		ConnMaxIdleTime: cfg.IdleTimeout,
 		TLSConfig:       tlsCfg,
+
+		ContextTimeoutEnabled: cfg.ContextTimeoutEnabled,
 	})
 
 	pingCtx, pingCancel := context.WithTimeout(ctx, cfg.DialTimeout+2*time.Second)
@@ -176,7 +181,8 @@ func dialDB(ctx context.Context, cfg *Config, db int) (*redis.Client, error) {
 // DefaultDB 优先同步拨号：它承载 Client 级快捷方法必须成功，失败时立即 fail-fast，
 // 其余 DB 无需再拨号。其余 DB 并发拨号以缩短启动时间；结果按 DB 编号确定性聚合，
 // 不依赖并发完成顺序。返回成功的连接集合与降级模式下各 DB 的失败原因；非降级模式
-// 下任一非默认 DB 失败时关闭全部已建连接并返回编号最小失败 DB 的确定性错误。
+// 下任一非默认 DB 失败、或失败源于 ctx 取消时，关闭全部已建连接并返回编号最小失败
+// DB 的确定性错误——ctx 取消是调用方要求中止，不能被降级语义吞成"DB 不可用"。
 func dialAll(ctx context.Context, cfg *Config, dbPrefixes map[int]string) (clients map[int]*redis.Client, failed map[int]error, err error) {
 	clients = make(map[int]*redis.Client, len(dbPrefixes))
 	cleanup := func() {
@@ -213,12 +219,10 @@ func dialAll(ctx context.Context, cfg *Config, dbPrefixes map[int]string) (clien
 	results := make([]dialResult, len(rest))
 	var wg sync.WaitGroup
 	for i, db := range rest {
-		wg.Add(1)
-		go func(i, db int) {
-			defer wg.Done()
+		wg.Go(func() {
 			rdb, e := dialDB(ctx, cfg, db)
 			results[i] = dialResult{db: db, rdb: rdb, err: e}
-		}(i, db)
+		})
 	}
 	wg.Wait()
 
@@ -240,9 +244,9 @@ func dialAll(ctx context.Context, cfg *Config, dbPrefixes map[int]string) (clien
 		clients[r.db] = r.rdb
 	}
 
-	// 非降级模式：任一非默认 DB 失败则整体失败，回收全部已建连接（含 DefaultDB 与
-	// 已成功的非默认 DB），返回确定性错误
-	if !cfg.AllowPartialInit && firstErr != nil {
+	// 非降级模式任一失败、或 ctx 已取消：整体失败，回收全部已建连接（含 DefaultDB
+	// 与已成功的非默认 DB），返回确定性错误
+	if firstErr != nil && (!cfg.AllowPartialInit || ctx.Err() != nil) {
 		cleanup()
 		return nil, nil, firstErr
 	}
@@ -273,13 +277,11 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	errs := make([]error, len(dbs))
 	var wg sync.WaitGroup
 	for i, db := range dbs {
-		wg.Add(1)
-		go func(i, db int) {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := c.clients[db].Ping(ctx).Err(); err != nil {
 				errs[i] = fmt.Errorf("db=%d ping: %w", db, err)
 			}
-		}(i, db)
+		})
 	}
 	wg.Wait()
 
@@ -342,9 +344,10 @@ func (c *Client) AddHook(hook redis.Hook) {
 	}
 }
 
-// Prefix 返回当前配置的全局 key 前缀。
+// Prefix 返回默认 DB 实际用于拼 key 的前缀：未被 [WithInitDBPrefix] 覆盖时即
+// [WithKeyPrefix] 的值，被覆盖时为覆盖值，与 Client 快捷方法拼出的 key 一致。
 func (c *Client) Prefix() string {
-	return c.keyPrefix
+	return c.prefix
 }
 
 // PoolStats 返回每个已初始化 DB 的连接池统计，key 为 DB 编号。

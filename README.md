@@ -84,13 +84,16 @@ token, err := c.MustSelectDB(2).Get(ctx, "token:abc").Result()
 | `WithIdleTimeout(d)`       | 空闲连接回收时间                                               | 5m                 |
 | `WithTLSConfig(cfg)`       | TLS 配置                                                       | nil（不启用）      |
 | `WithAllowPartialInit()`   | 降级模式：失败 DB 缺席集合，错误聚合返回（DefaultDB 仍须成功） | 关闭（全有或全无） |
+| `WithContextTimeoutEnabled()` | 命令级 ctx deadline 也约束 socket 读写（透传 go-redis 同名选项）  | 关闭（与 go-redis 一致） |
 
 **关于 `WithMaxRetries`**：对非幂等命令（如 `INCR`、`LPUSH`），读超时后的自动重试可能导致命令被重复执行。对此敏感的场景请设置为 0 关闭重试，或在业务层用 Lua 脚本保证幂等。
+
+**关于 ctx 与超时**：默认下（与 go-redis 一致）ctx 只在取连接、拨号与重试退避处生效，socket 读写只受 `ReadTimeout` / `WriteTimeout` 约束。因此 ctx 取消或超时后，普通命令最多还会等待 `ReadTimeout × (MaxRetries + 1)`，`ConsumeStream` 的阻塞读取最多再等 `Block + ReadTimeout`。需要 ctx deadline 直接截断读写的调用链请开启 `WithContextTimeoutEnabled()`，此时命令以 `context.DeadlineExceeded` 失败。
 
 ### 初始化语义
 
 - `NewClient` 会对每个声明的 DB 建立独立连接池并执行 PING 验证，**DefaultDB 优先拨号**：它承载 Client 级快捷方法，失败时立即整体失败、其余 DB 不再拨号；其余 DB **并发拨号**以缩短启动时间，结果按 DB 编号确定聚合，错误信息不受并发完成顺序影响。
-- `NewClientContext(ctx, opts...)` 与 `NewClient` 相同，但初始化拨号与 PING 均受传入 `ctx` 约束：`ctx` 取消或超时即中止初始化并回收已建连接。`NewClient` 等价于以 `context.Background()` 调用它，需要约束启动耗时或支持取消的场景请用 `NewClientContext`。
+- `NewClientContext(ctx, opts...)` 与 `NewClient` 相同，但初始化拨号与 PING 均受传入 `ctx` 约束：`ctx` 取消或超时即中止初始化并回收已建连接，降级模式下同样中止而不是把取消当作 DB 故障。默认下 PING 的 socket 读取仍受 `ReadTimeout` 约束，取消后最多再等一个 `ReadTimeout`。`NewClient` 等价于以 `context.Background()` 调用它，需要约束启动耗时或支持取消的场景请用 `NewClientContext`。
 - 默认**全有或全无**：任一 DB 验证失败，整体返回错误并回收已建连接。
 - TLS 配置对每个底层 client 使用独立副本（`tls.Config.Clone()`），多 DB 间互不影响。
 - `clients` / `proxies` 集合在构建完成后只读，后续并发使用无需加锁；`HealthCheck` 对各 DB 并发 PING 并聚合全部失败（不短路）。
@@ -166,7 +169,7 @@ for key, err := range c.ScanKeys(ctx, "user:*") {
 p := c.MustSelectDB(0)
 full := p.Key("user:1")           // "myapp:user:1"
 fulls := p.Keys("k1", "k2")       // ["myapp:k1", "myapp:k2"]
-prefix := c.Prefix()              // "myapp"
+prefix := c.Prefix()              // 默认 DB 实际生效的前缀："myapp"；被 WithInitDBPrefix(默认DB, x) 覆盖时为 x
 ```
 
 ### 同一 DB 多命名空间
@@ -235,8 +238,7 @@ default:
 ### String / 计数器
 
 ```go
-c.Set(ctx, "k", "v", time.Hour)        // expiration 为 0 表示不过期
-c.SetEX(ctx, "k", "v", time.Hour)      // SET 带过期（SETEX 现代等价）
+c.Set(ctx, "k", "v", time.Hour)        // expiration 为 0 表示不过期；SetEX 已废弃，与 Set 相同
 ok, _ := c.SetNX(ctx, "k", "v", ttl).Result() // 不存在才写，true=写入成功
 old, _ := c.GetSet(ctx, "k", "new").Result()  // 写新值返回旧值（SET..GET，Redis>=6.2）
 v, _ := c.GetDel(ctx, "k").Result()    // 取值并删除
@@ -347,6 +349,8 @@ c.ZIncrBy(ctx, "rank", 5, "alice")
 ```go
 // SCAN + UNLINK 批量删除：UNLINK 后台异步释放内存，大 value 不阻塞主线程。
 // pattern 自动拼前缀（"user:*" 实际匹配 "myapp:user:*"），返回删除总数。
+// 前缀是唯一的隔离边界：未配置前缀时 "*" 等同清空当前 DB，FencedLock 的
+// __fence__ 计数器也在前缀命名空间内，宽 pattern 会一并删除。
 // 建议传带超时的 ctx 控制执行时间。
 deleted, err := c.DelByPattern(ctx, "user:*")
 
@@ -420,7 +424,9 @@ sub = c.PSubscribe(ctx, "events:*")
 defer sub.Close()
 ```
 
-`Consume` / `ConsumePattern` 的 handler **串行执行**以保证单频道顺序，耗时处理请投递到业务自有 worker；handler panic 会被恢复，消费终止并以 error 返回。
+`Consume` / `ConsumePattern` 的 handler **串行执行**以保证单频道顺序，耗时处理请投递到业务自有 worker；handler panic 会被恢复，消费终止并以 error 返回。订阅确认受底层 `ReadTimeout` 约束，服务端不回确认时按读超时失败而不是无限等待。
+
+任何订阅连接错误都会让 `Consume` 返回，库内不重连；长期消费请在外层循环中带退避重新调用（写法见 [Stream 消费循环](#消费循环与重启)）。
 
 如果配置了 `WithChannelPrefix("myapp")`，上面的 `"events:user"` 实际发布 / 订阅到 `"myapp:events:user"`；模式 `"events:*"` 实际订阅到 `"myapp:events:*"`。
 
@@ -465,6 +471,7 @@ case errors.Is(err, redisx.ErrLockLost):
 - `TryLock` 非阻塞；需要阻塞等待时由调用方按业务节奏循环重试（库不内置轮询策略）。冲突错误用 `errors.Is(err, ErrLockNotObtained)` 判断，错误消息携带完整 key 便于排障。
 - `ttl` 必须至少为 1ms——Redis TTL 精度为毫秒，无 TTL 的锁等于死锁隐患。
 - `Release` / `Refresh` 在锁已过期或被他人重新获取时返回 `ErrLockLost`，且**不会影响他人的锁**。
+- `Release` 的 `ErrLockLost` 在自动重试下有假阳性：DEL 已在服务端执行但响应丢失，重发时 token 已不匹配，返回 `ErrLockLost` 而锁其实已由本持有者正常释放。库内无法区分这两种情况，把 `ErrLockLost` 当作"互斥已破坏"触发补偿的场景请 `WithMaxRetries(0)`。
 - 观测自检：`lock.Key()` 返回完整锁 key（供日志/打点）；`lock.TTL(ctx)` 校验 token 后原子返回剩余时长，锁已失去返回 `ErrLockLost`。注意 TTL 仅供观测——查询与后续操作之间锁仍可能过期，互斥正确性依赖 `Release`/`Refresh` 自身的 token 校验。
 - 非 RedLock：主从异步复制下故障切换瞬间存在双持有的理论窗口，关键互斥请在业务层做幂等兜底。
 - 不提供 watchdog 自动续期，生命周期由业务显式管理。
@@ -483,7 +490,9 @@ defer lock.Release(ctx)
 writeToResource(lock.Fence(), payload) // 把 token 传给下游资源
 ```
 
-`FencedLock` 嵌入 `Lock`，`Key` / `Release` / `Refresh` / `TTL` 语义完全一致，额外提供 `Fence()`。**栅栏仅在下游被保护资源记录见过的最大 token 并拒绝更小者时才生效**，本库只负责原子生成与暴露 token。fencing 计数器是一个持久（无 TTL）的 `<锁key>:__fence__`，`Release` 不删除它以保证跨获取单调，请勿手动删除。
+`FencedLock` 嵌入 `Lock`，`Key` / `Release` / `Refresh` / `TTL` 语义完全一致，额外提供 `Fence()`。**栅栏仅在下游被保护资源记录见过的最大 token 并拒绝更小者时才生效**，本库只负责原子生成与暴露 token。
+
+token 的生成方式：`fence = max(计数器, 客户端 Unix 毫秒 << 10) + 1`，计数器 key 为 `<完整锁key>:__fence__`，每次获取续期 24 小时，不永久存在。计数器存活期内严格递增与时钟无关；24 小时无人获取、计数器过期后由时间下界接管，此时要打破单调，前后两次获取的客户端时钟偏差需超过 24 小时。`fence >> 10` 即获取时刻的近似毫秒时间戳，可用于排障。token 量级约 1.8×10^15，小于 2^53，JSON / JavaScript Number 可精确表示；下游记录它的字段必须是 64 位整数（如 `BIGINT`）。`Release` 不删除计数器；它被 `DelByPattern` 宽 pattern 删掉时只是退化为依赖时间下界，不会回退成小值。v1.3.0 写入的无 TTL 计数器在首次获取时自动获得 TTL。
 
 ---
 
@@ -537,7 +546,37 @@ err := c.ConsumeStream(ctx, redisx.StreamConfig{
 
 - 消费组不存在时自动创建；启动时先续传本消费者的 pending（崩溃重启不丢已读未确认的消息），再消费新消息。
 - handler **串行执行**保证顺序；panic 被恢复，消费终止并以 error 返回。
-- ctx 取消时返回 ctx 的错误（`errors.Is(err, context.Canceled)` 判断优雅退出）。
+- ctx 取消时返回 ctx 的错误（`errors.Is(err, context.Canceled)` 判断优雅退出）。默认下取消在 `XREADGROUP` 阻塞期间不被观察，最多再等 `Block + ReadTimeout`。
+- 任何 Redis 命令错误（含瞬时网络错误）终止消费并以 error 返回，库内不重试不重连；未确认消息留在 pending，重启后续传。
+
+### 消费循环与重启
+
+`ConsumeStream` / `Consume` 出错即返回，把"要不要重启、退避多久"留给调用方。长期消费的标准写法是外层循环加退避：
+
+```go
+for backoff := time.Second; ; {
+    err := c.ConsumeStream(ctx, cfg, handler)
+    if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+        return err // 优雅退出
+    }
+    log.Printf("consume stream exited: %v, retry in %s", err, backoff)
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case <-time.After(backoff):
+    }
+    backoff = min(backoff*2, 30*time.Second)
+}
+```
+
+### 集群部署注意事项
+
+Redis 集群（含阿里云集群版代理模式与直连模式）要求 Lua 脚本内所有 key 位于同一 slot，代理模式还会对脚本做语法预检。本库涉及多 key 脚本的两处及其要求：
+
+- `FencedLock`：计数器 key 是锁 key 追加 `:__fence__`，锁 key 带 hash tag（如 `{order:1}`）时计数器沿用同一 tag，自然同 slot。
+- 死信转移：源流与死信流必须同 hash tag（如 `{orders}` 与 `{orders}:dlq`）。消息字段不超过 92 个时脚本不含 `unpack`，兼容代理预检；更宽的消息回退到 `unpack` 形式，在开源 Redis 上正常，在做预检的代理上报错并经 `ConsumeStream` 返回。
+
+`TryLock` / `Release` / `Refresh` / `TTL` 均为单 key 脚本，不受影响。
 
 ### 死信队列（毒消息隔离）
 

@@ -88,6 +88,11 @@ type Config struct {
 	// AllowPartialInit 允许部分 DB 初始化失败（降级模式）。
 	// 默认 false：任一 DB 失败则整体失败（全有或全无）。
 	AllowPartialInit bool
+
+	// ContextTimeoutEnabled 透传 go-redis 同名选项：为 true 时命令级 ctx 的
+	// deadline 也约束 socket 读写。默认 false（go-redis 默认），此时 ctx 只在
+	// 取连接、拨号与重试退避处生效，见 [WithContextTimeoutEnabled]。
+	ContextTimeoutEnabled bool
 }
 
 // defaultConfig 返回包含生产合理默认值的 Config。
@@ -304,6 +309,18 @@ func WithChannelPrefixSeparator(separator string) Option {
 // 适用于云厂商强制加密的 Redis 实例。nil 表示不启用 TLS。
 func WithTLSConfig(tlsConfig *tls.Config) Option {
 	return func(c *Config) { c.TLSConfig = tlsConfig }
+}
+
+// WithContextTimeoutEnabled 让命令级 ctx 的 deadline 也约束 socket 读写超时
+// （透传 go-redis 的 ContextTimeoutEnabled）。
+//
+// 默认关闭，与 go-redis 一致：ctx 只在取连接、拨号与重试退避处生效，socket
+// 读写只受 ReadTimeout / WriteTimeout 约束，因此 ctx 取消或超时后命令最多还会
+// 等待 ReadTimeout×(MaxRetries+1)，阻塞型读取（如 ConsumeStream 的 XREADGROUP）
+// 最多再等 Block+ReadTimeout。开启后 ctx deadline 早于上述超时时以 ctx 为准，
+// 命令以 context.DeadlineExceeded 失败，适合需要严格超时预算的调用链。
+func WithContextTimeoutEnabled() Option {
+	return func(c *Config) { c.ContextTimeoutEnabled = true }
 }
 
 // WithAllowPartialInit 允许部分 DB 初始化失败（降级模式）。
